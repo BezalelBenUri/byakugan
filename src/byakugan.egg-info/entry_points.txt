@@ -1,0 +1,2 @@
+[console_scripts]
+byakugan = byakugan_app.__main__:main
