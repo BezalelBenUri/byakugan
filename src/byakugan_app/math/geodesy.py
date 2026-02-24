@@ -37,7 +37,11 @@ def ecef_to_geodetic(x: float, y: float, z: float) -> Tuple[float, float, float]
 
 
 def enu_to_ecef(east: float, north: float, up: float, lat0: float, lon0: float) -> Tuple[float, float, float]:
-    """Convert ENU offsets to ECEF deltas relative to a reference point."""
+    """Convert ENU offsets to ECEF deltas relative to a reference point.
+
+    The transform uses the WGS84 local tangent frame with axes:
+    East, North, Up -> X, Y, Z in Earth-Centred Earth-Fixed coordinates.
+    """
     lat = math.radians(lat0)
     lon = math.radians(lon0)
 
@@ -46,16 +50,34 @@ def enu_to_ecef(east: float, north: float, up: float, lat0: float, lon0: float) 
     slon = math.sin(lon)
     clon = math.cos(lon)
 
+    # ENU->ECEF rotation matrix.
+    # Reference: standard local tangent frame transform.
     t = np.array(
         [
-            [-slon, clon, 0.0],
-            [-slat * clon, -slat * slon, clat],
-            [clat * clon, clat * slon, slat],
+            [-slon, -slat * clon, clat * clon],
+            [clon, -slat * slon, clat * slon],
+            [0.0, clat, slat],
         ],
         dtype=float,
     )
     ecef_delta = t @ np.array([east, north, up], dtype=float)
     return tuple(float(v) for v in ecef_delta)
+
+
+def ecef_to_enu(dx: float, dy: float, dz: float, lat0: float, lon0: float) -> Tuple[float, float, float]:
+    """Convert ECEF deltas to ENU offsets at the reference latitude/longitude."""
+    lat = math.radians(lat0)
+    lon = math.radians(lon0)
+
+    slat = math.sin(lat)
+    clat = math.cos(lat)
+    slon = math.sin(lon)
+    clon = math.cos(lon)
+
+    east = (-slon * dx) + (clon * dy)
+    north = (-slat * clon * dx) + (-slat * slon * dy) + (clat * dz)
+    up = (clat * clon * dx) + (clat * slon * dy) + (slat * dz)
+    return float(east), float(north), float(up)
 
 
 def enu_to_geodetic(
@@ -71,6 +93,20 @@ def enu_to_geodetic(
     dx, dy, dz = enu_to_ecef(east, north, up, origin_lat, origin_lon)
     lat, lon, alt = ecef_to_geodetic(x0 + dx, y0 + dy, z0 + dz)
     return lat, lon, alt
+
+
+def geodetic_to_enu(
+    target_lat: float,
+    target_lon: float,
+    target_alt: float,
+    origin_lat: float,
+    origin_lon: float,
+    origin_alt: float,
+) -> Tuple[float, float, float]:
+    """Convert geodetic target coordinates to ENU relative to origin."""
+    x0, y0, z0 = geodetic_to_ecef(origin_lon, origin_lat, origin_alt)
+    xt, yt, zt = geodetic_to_ecef(target_lon, target_lat, target_alt)
+    return ecef_to_enu(xt - x0, yt - y0, zt - z0, origin_lat, origin_lon)
 
 
 def enu_flat_earth(
