@@ -6,9 +6,12 @@ Byakugan is a native Python desktop application that lets Insta360 Pro2 users ex
 - GPU-accelerated panorama viewer with smooth pan, tilt, zoom, and keyboard-assisted navigation.
 - Auto-detects stereo 360 formats (top-bottom or side-by-side) and offers one-click depth reconstruction.
 - Bearing-aware initial orientation and reset view controls aligned with the camera compass bearing.
-- Crosshair-based point picking that reports pixel indices, depth, ENU vectors, and lat/lon/alt in real time.
+- Crosshair-based point picking that reports pixel indices, range/depth, ENU vectors, and lat/lon/alt in real time.
 - Depth map ingestion (grayscale or float) plus optional stereo reconstruction using OpenCV's `StereoSGBM`.
+- Ground-plane fallback mode for panorama-only measurements when no depth map is available.
+- Two-frame triangulation mode for panorama-only depth recovery using the same feature across two capture frames.
 - Configurable camera pose inputs (lat, lon, altitude, compass bearing) and precise ENU to ECEF conversions via `pyproj`, applied to every measurement in real time.
+- Frame pitch/roll-aware ray projection for capture-sequence measurements.
 - Measurement history with CSV/JSON export for GIS pipelines and a depth-source readout for traceability.
 - Dark, high-DPI-aware UI inspired by Fluent design.
 
@@ -34,10 +37,24 @@ python -m byakugan_app
 ### 4. Load your data
 1. Click **Load Panorama...** and choose a stitched equirectangular RGB image (e.g., 7680x3840 or 7680x7680 for stereo top-bottom).
 2. Provide the capture latitude, longitude, altitude (meters), and bearing (degrees clockwise from north).
-3. If a stereo panorama is detected, Byakugan offers to split the image automatically and generate depth. You can override the detected format and optical parameters in the **Generate Depth Map...** dialog.
-4. Alternatively, load a pre-computed depth map or supply external left/right images for stereo matching.
+3. Optionally load a pre-computed depth map or generate depth from stereo via **Generate Depth Map...**.
+4. Measurement engine selection is automatic (no mode switch required):
+   - capture folders -> **Two-Frame Triangulation** first (highest non-depth accuracy)
+   - depth map available -> **Depth Map**
+   - otherwise -> **Ground Plane** fallback
 5. Click within the viewer to record measurements; results show in the sidebar and measurement table.
 6. Use **Reset View (Front)** to re-center on the camera bearing whenever you update the pose.
+7. For higher panorama-only accuracy, prefer **Two-Frame Triangulation** with frames that have good camera baseline and clear feature visibility.
+
+### NCTech stitched capture folders
+Byakugan can load stitched NCTech exports directly via **Load NCTech Capture Folder...**.
+
+- Supported layout: capture root containing `Output/` with `*.jpg` frames and a `*_framepos.txt` file.
+- Frame navigation is available inside the **Data Sources** panel (`Capture Frame` control).
+- Pose fields are auto-populated per frame from `framepos` (`lat/lon/alt/heading`).
+- Raw `*-gps.txt` and `*-imu.csv` files are discovered for future processing.
+
+See `docs/NCTECH_CAPTURE_WORKFLOW.md` for detailed schema and constraints.
 
 A warning banner appears while the default pose (0,0,0) is active; update the spin boxes for accurate absolute coordinates.
 
