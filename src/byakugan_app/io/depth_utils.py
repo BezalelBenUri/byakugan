@@ -178,10 +178,27 @@ def compute_depth_from_stereo_images(
     right_gray: np.ndarray,
     config: StereoDepthConfig,
 ) -> np.ndarray:
-    """Run Semi-Global Block Matching on grayscale stereo views."""
+    """Run Semi-Global Block Matching on grayscale stereo views.
+
+    OpenCV requires ``numDisparities`` to be a positive multiple of 16 and
+    practically bounded by image width. We clamp it defensively so small test
+    images and reduced-resolution frames do not trigger allocation failures.
+    """
+    image_width = int(left_gray.shape[1])
+    if image_width < 32:
+        raise ValueError(
+            f"Stereo input width {image_width} is too small for SGBM. Minimum supported width is 32 px."
+        )
+
+    # SGBM expects minDisparity + numDisparities < image width.
+    max_disparities = ((image_width - 16) // 16) * 16
+    max_disparities = max(16, max_disparities)
+    num_disparities = max(16, (int(config.num_disparities) // 16) * 16)
+    num_disparities = min(num_disparities, max_disparities)
+
     matcher = cv2.StereoSGBM_create(
         minDisparity=0,
-        numDisparities=config.num_disparities,
+        numDisparities=num_disparities,
         blockSize=config.block_size,
         P1=8 * 3 * config.block_size**2,
         P2=32 * 3 * config.block_size**2,
@@ -200,11 +217,20 @@ def compute_depth_from_stereo_images(
     depth = (config.focal_length_px * config.baseline_m) / (disparity + epsilon)
     depth = np.where(np.isfinite(depth), depth, np.nan)
 
+    finite_depth = depth[np.isfinite(depth)]
+    if finite_depth.size:
+        range_min = float(np.min(finite_depth))
+        range_max = float(np.max(finite_depth))
+    else:
+        range_min = float("nan")
+        range_max = float("nan")
+
     logger.info(
-        "Stereo depth computed: baseline=%.3f m, focal=%.2f px, range=[%.2f, %.2f] m",
+        "Stereo depth computed: baseline=%.3f m, focal=%.2f px, disparities=%d, range=[%.2f, %.2f] m",
         config.baseline_m,
         config.focal_length_px,
-        float(np.nanmin(depth)),
-        float(np.nanmax(depth)),
+        num_disparities,
+        range_min,
+        range_max,
     )
     return depth.astype(np.float32)
