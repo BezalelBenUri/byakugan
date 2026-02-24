@@ -19,6 +19,7 @@ import json
 
 
 import math
+from dataclasses import dataclass
 
 
 
@@ -46,7 +47,7 @@ from loguru import logger
 
 
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction, QImage, QPixmap
 
 
@@ -178,6 +179,7 @@ from ..io.depth_utils import (
 
 
 from ..io.loader import StereoDepthConfig, compute_depth_from_stereo, load_depth_map, load_equirectangular_image
+from ..io.nctech_capture import NCTechStitchedCapture, discover_stitched_capture
 
 
 
@@ -214,6 +216,18 @@ from .depth_generation_dialog import DepthGenerationDialog, DepthGenerationMode
 from .measurement_table_model import MeasurementTableModel
 
 
+@dataclass(slots=True)
+class TriangulationAnchor:
+    """Stores the first ray/pose used for two-frame triangulation."""
+
+    frame_index: int
+    pose: CameraPose
+    theta: float
+    phi: float
+    pitch_deg: float
+    roll_deg: float
+
+
 
 
 
@@ -228,6 +242,11 @@ class MainWindow(QMainWindow):
 
 
     """Primary window containing the viewer and controls."""
+
+    MEASUREMENT_MODE_AUTO = "auto"
+    MEASUREMENT_MODE_DEPTH = "depth_map"
+    MEASUREMENT_MODE_GROUND = "ground_plane"
+    MEASUREMENT_MODE_TRIANGULATION = "triangulation_2frame"
 
 
 
@@ -278,6 +297,14 @@ class MainWindow(QMainWindow):
         self._needs_reorient = False
         self._format_combo_block = False
         self._syncing_render_view = False
+        self._active_capture: Optional[NCTechStitchedCapture] = None
+        self._capture_spin_block = False
+        self._capture_base_roll_offset_deg = 0.0
+        self._pose_pitch_deg = 0.0
+        self._pose_roll_deg = 0.0
+        self._manual_roll_correction_deg = 0.0
+        self._measurement_mode = self.MEASUREMENT_MODE_AUTO
+        self._triangulation_anchor: Optional[TriangulationAnchor] = None
 
         self._build_ui()
 
@@ -499,6 +526,7 @@ class MainWindow(QMainWindow):
         self.navigation_hint_label.setStyleSheet("color: #8aa; font-size: 11px;")
 
         load_image_btn = QPushButton("Load Panorama...")
+        load_capture_btn = QPushButton("Load NCTech Capture Folder...")
         load_depth_btn = QPushButton("Load Depth Map...")
         generate_depth_btn = QPushButton("Generate Depth Map...")
         self.reset_view_button = QPushButton("Reset View")
@@ -518,8 +546,20 @@ class MainWindow(QMainWindow):
         self.render_view_combo.currentIndexChanged.connect(self._on_render_view_changed)
 
         load_image_btn.clicked.connect(self._on_load_panorama_clicked)
+        load_capture_btn.clicked.connect(self._on_load_nctech_capture_clicked)
         load_depth_btn.clicked.connect(self._on_load_depth_clicked)
         generate_depth_btn.clicked.connect(self._on_generate_depth_clicked)
+
+        self.capture_frame_spin = QSpinBox()
+        self.capture_frame_spin.setRange(0, 0)
+        self.capture_frame_spin.setEnabled(False)
+        self.capture_frame_spin.valueChanged.connect(self._on_capture_frame_changed)
+        self.capture_frame_total_label = QLabel("/ 0")
+        self.detected_frames_label = QLabel("Detected Frames: 0")
+        self.detected_frames_label.setStyleSheet("color: #8aa; font-size: 11px;")
+        self.capture_status_label = QLabel("Capture sequence: -")
+        self.capture_status_label.setWordWrap(True)
+        self.capture_status_label.setStyleSheet("color: #8aa; font-size: 11px;")
 
         def _reset_view_handler():
             self._perform_reset_view()
@@ -528,7 +568,16 @@ class MainWindow(QMainWindow):
         self.reset_view_button.clicked.connect(_reset_view_handler)
 
         vbox.addWidget(load_image_btn)
+        vbox.addWidget(load_capture_btn)
         vbox.addWidget(self.image_path_display)
+        frame_row = QHBoxLayout()
+        frame_row.setSpacing(6)
+        frame_row.addWidget(QLabel("Capture Frame:"))
+        frame_row.addWidget(self.capture_frame_spin, 1)
+        frame_row.addWidget(self.capture_frame_total_label)
+        vbox.addLayout(frame_row)
+        vbox.addWidget(self.detected_frames_label)
+        vbox.addWidget(self.capture_status_label)
         vbox.addSpacing(4)
         vbox.addWidget(load_depth_btn)
         vbox.addWidget(self.depth_path_display)
@@ -599,7 +648,20 @@ class MainWindow(QMainWindow):
         sensitivity_row.addWidget(self.mouse_sensitivity_value_label)
         vbox.addLayout(sensitivity_row)
 
-        hint_label = QLabel("If rotation feels wrong, adjust sensitivity or invert axes.")
+        roll_row = QHBoxLayout()
+        roll_row.setSpacing(6)
+        roll_row.addWidget(QLabel("Roll Offset:"))
+        self.roll_correction_spin = QDoubleSpinBox()
+        self.roll_correction_spin.setRange(-180.0, 180.0)
+        self.roll_correction_spin.setDecimals(1)
+        self.roll_correction_spin.setSingleStep(1.0)
+        self.roll_correction_spin.setSuffix(" deg")
+        self.roll_correction_spin.setValue(0.0)
+        self.roll_correction_spin.valueChanged.connect(self._on_roll_correction_changed)
+        roll_row.addWidget(self.roll_correction_spin, 1)
+        vbox.addLayout(roll_row)
+
+        hint_label = QLabel("If orientation feels tilted, adjust Roll Offset; otherwise tune sensitivity or invert axes.")
         hint_label.setStyleSheet("color: #8aa; font-size: 11px;")
         hint_label.setWordWrap(True)
         vbox.addWidget(hint_label)
@@ -611,6 +673,28 @@ class MainWindow(QMainWindow):
     def _build_selection_group(self) -> QGroupBox:
         group = QGroupBox("Selection Readout")
         form = QFormLayout(group)
+
+        self.measurement_mode_combo = QComboBox()
+        self.measurement_mode_combo.addItem("Automatic", self.MEASUREMENT_MODE_AUTO)
+        self.measurement_mode_combo.setCurrentIndex(0)
+        self.measurement_mode_combo.setEnabled(False)
+        self.measurement_mode_combo.setVisible(False)
+        self.measurement_mode_combo.setToolTip(
+            "Byakugan automatically selects the best available measurement engine."
+        )
+        self.measurement_mode_combo.currentIndexChanged.connect(self._on_measurement_mode_changed)
+
+        self.ground_height_spin = QDoubleSpinBox()
+        self.ground_height_spin.setRange(0.10, 10.00)
+        self.ground_height_spin.setDecimals(2)
+        self.ground_height_spin.setSingleStep(0.10)
+        self.ground_height_spin.setSuffix(" m")
+        self.ground_height_spin.setValue(1.70)
+        self.ground_height_spin.setEnabled(False)
+        self.ground_height_spin.valueChanged.connect(self._on_ground_height_changed)
+        self.triangulation_label = QLabel("Select anchor point")
+        self.triangulation_label.setWordWrap(True)
+        self.triangulation_label.setStyleSheet("color: #8aa; font-size: 11px;")
 
         self.hover_label = QLabel("-")
         self.pixel_label = QLabel("-")
@@ -633,6 +717,8 @@ class MainWindow(QMainWindow):
         ):
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        form.addRow("Fallback Height", self.ground_height_spin)
+        form.addRow("Triangulation", self.triangulation_label)
         form.addRow("Hover", self.hover_label)
         form.addRow("Pixel", self.pixel_label)
         form.addRow("Depth", self.depth_label)
@@ -640,6 +726,16 @@ class MainWindow(QMainWindow):
         form.addRow("Lat/Lon/Alt", self.geo_label)
         form.addRow("Depth Source", self.depth_source_label)
         form.addRow("Pose Context", self.pose_summary_label)
+
+        mode_hint = QLabel(
+            "Automatic engine selection: Two-Frame Triangulation (capture folders), "
+            "Depth Map (if loaded), or Ground Plane fallback."
+        )
+        mode_hint.setWordWrap(True)
+        mode_hint.setStyleSheet("color: #8aa; font-size: 11px;")
+        form.addRow("", mode_hint)
+        self._update_depth_source_label()
+        self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
         return group
 
 
@@ -793,6 +889,10 @@ class MainWindow(QMainWindow):
 
 
         file_menu.addAction(load_action)
+
+        load_capture_action = QAction("Load NCTech Capture Folder...", self)
+        load_capture_action.triggered.connect(self._on_load_nctech_capture_clicked)
+        file_menu.addAction(load_capture_action)
 
 
 
@@ -968,6 +1068,30 @@ class MainWindow(QMainWindow):
         self._update_reset_button_state()
         logger.debug("Camera pose updated: {}", pose)
 
+    def _set_camera_pose_fields(
+        self,
+        latitude: float,
+        longitude: float,
+        altitude: float,
+        bearing: float,
+    ) -> None:
+        """Update pose widgets atomically and refresh the derived camera pose state."""
+        fields = (self.lat_field, self.lon_field, self.alt_field, self.bearing_field)
+        for field in fields:
+            field.blockSignals(True)
+        self.lat_field.setValue(latitude)
+        self.lon_field.setValue(longitude)
+        self.alt_field.setValue(altitude)
+        self.bearing_field.setValue(bearing % 360.0)
+        for field in fields:
+            field.blockSignals(False)
+        self._update_camera_pose()
+
+    def _apply_view_roll(self) -> None:
+        """Apply pose-derived roll and manual operator offset to the viewer."""
+        total_roll = self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
+        self.viewer.set_view_roll_degrees(total_roll)
+
 
     # ------------------------------------------------------------------
 
@@ -976,6 +1100,115 @@ class MainWindow(QMainWindow):
     # Data loading
 
 
+
+    def _on_load_nctech_capture_clicked(self) -> None:
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select NCTech Capture Folder",
+            "",
+        )
+        if not folder:
+            return
+
+        capture_path = Path(folder)
+        self.statusBar().showMessage("Scanning NCTech capture folder...")
+        task = FunctionTask(discover_stitched_capture, capture_path)
+        self._bind_task(task, self._nctech_capture_loaded)
+
+    def _nctech_capture_loaded(self, capture: NCTechStitchedCapture) -> None:
+        self._active_capture = capture
+        self._capture_base_roll_offset_deg = 0.0
+        self._clear_triangulation_anchor(update_label=True)
+        self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
+        self._capture_spin_block = True
+        self.capture_frame_spin.setEnabled(capture.frame_count > 0)
+        self.capture_frame_spin.setRange(0, max(0, capture.frame_count - 1))
+        self.capture_frame_spin.setValue(0)
+        self.capture_frame_total_label.setText(f"/ {capture.frame_count - 1}")
+        self.detected_frames_label.setText(f"Detected Frames: {capture.frame_count}")
+        self._capture_spin_block = False
+
+        capture_label = capture.capture_id or capture.capture_root.name
+        self.capture_status_label.setText(
+            f"Capture sequence: {capture_label} | Frames: {capture.frame_count} | "
+            f"Resolution: {capture.frame_width}x{capture.frame_height}"
+        )
+        self._load_capture_frame(0, reset_orientation=True)
+
+    def _on_capture_frame_changed(self, frame_index: int) -> None:
+        if self._capture_spin_block or self._active_capture is None:
+            return
+        self._load_capture_frame(frame_index, reset_orientation=False)
+
+    def _load_capture_frame(self, frame_index: int, reset_orientation: bool) -> None:
+        capture = self._active_capture
+        if capture is None:
+            return
+        if frame_index < 0 or frame_index >= capture.frame_count:
+            return
+        frame = capture.frames[frame_index]
+        task = FunctionTask(load_equirectangular_image, frame.image_path)
+        handler = lambda image, idx=frame_index, orient=reset_orientation: self._capture_frame_loaded(
+            idx, image, orient
+        )
+        self._bind_task(task, handler)
+        self.statusBar().showMessage(f"Loading capture frame {frame_index}...")
+
+    def _capture_frame_loaded(self, frame_index: int, image: np.ndarray, reset_orientation: bool) -> None:
+        capture = self._active_capture
+        if capture is None or frame_index < 0 or frame_index >= capture.frame_count:
+            return
+
+        frame = capture.frames[frame_index]
+        self._pose_pitch_deg = float(frame.pitch_deg)
+        self._pose_roll_deg = float(frame.roll_deg)
+        self._apply_view_roll()
+        self._state.set_image(image, frame.image_path)
+        self._refresh_viewer_image(reset_orientation=reset_orientation)
+        self.viewer.set_instruction_visible(frame_index == 0)
+        self._set_camera_pose_fields(
+            latitude=frame.latitude,
+            longitude=frame.longitude,
+            altitude=frame.altitude_m,
+            bearing=frame.heading_deg,
+        )
+
+        self.image_path_display.setText(str(frame.image_path))
+        self.depth_path_display.setText("[None]")
+        self.measurement_model.clear()
+        self._needs_reorient = False
+
+        self._update_format_status()
+        self._update_depth_source_label()
+        self._update_pose_warning()
+        self._update_pose_summary()
+        self._update_reset_button_state()
+        self._update_render_view_controls()
+        self._update_overlay_metadata()
+
+        self.statusBar().showMessage(
+            f"Capture frame {frame_index} loaded "
+            f"(heading {frame.heading_deg:.2f} deg, pitch {frame.pitch_deg:.2f} deg, "
+            f"roll {frame.roll_deg:.2f} deg, base offset {self._capture_base_roll_offset_deg:+.1f} deg)",
+            4000,
+        )
+
+    def _clear_active_capture(self) -> None:
+        self._active_capture = None
+        self._capture_base_roll_offset_deg = 0.0
+        self._pose_pitch_deg = 0.0
+        self._pose_roll_deg = 0.0
+        self._apply_view_roll()
+        self._clear_triangulation_anchor()
+        self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
+        self._capture_spin_block = True
+        self.capture_frame_spin.setEnabled(False)
+        self.capture_frame_spin.setRange(0, 0)
+        self.capture_frame_spin.setValue(0)
+        self.capture_frame_total_label.setText("/ 0")
+        self.detected_frames_label.setText("Detected Frames: 0")
+        self.capture_status_label.setText("Capture sequence: -")
+        self._capture_spin_block = False
 
     def _on_load_panorama_clicked(self) -> None:
 
@@ -1014,6 +1247,7 @@ class MainWindow(QMainWindow):
 
 
         file_path = Path(path)
+        self._clear_active_capture()
 
 
 
@@ -1488,7 +1722,7 @@ class MainWindow(QMainWindow):
 
         stereo_detection = self._state.stereo_detection
         if stereo_detection and stereo_detection.is_stereo:
-            QTimer.singleShot(250, self._prompt_stereo_depth)
+            logger.info("Stereo panorama detected; continuing in panorama-first workflow.")
 
     def _depth_loaded(self, depth: np.ndarray, path: Optional[Path], source: str) -> None:
 
@@ -1585,8 +1819,25 @@ class MainWindow(QMainWindow):
         self.format_combo.setEnabled(self._state.has_image)
         self._format_combo_block = False
 
+    def _resolve_measurement_mode(self) -> str:
+        """Resolve the effective measurement mode from current available inputs."""
+        if self._measurement_mode != self.MEASUREMENT_MODE_AUTO:
+            return self._measurement_mode
+        if self._active_capture is not None and self._active_capture.frame_count >= 2:
+            return self.MEASUREMENT_MODE_TRIANGULATION
+        if self._state.has_depth:
+            return self.MEASUREMENT_MODE_DEPTH
+        return self.MEASUREMENT_MODE_GROUND
+
     def _update_depth_source_label(self) -> None:
-        source = self._state.depth_source or "-"
+        effective_mode = self._resolve_measurement_mode()
+        if effective_mode == self.MEASUREMENT_MODE_GROUND:
+            camera_height = self.ground_height_spin.value() if hasattr(self, "ground_height_spin") else 1.7
+            source = f"Ground plane estimate (camera height {camera_height:.2f} m)"
+        elif effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
+            source = "Two-frame triangulation"
+        else:
+            source = self._state.depth_source or "-"
         self.depth_source_label.setText(source)
 
     def _update_render_view_controls(self) -> None:
@@ -1648,6 +1899,142 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'mouse_sensitivity_value_label'):
             self.mouse_sensitivity_value_label.setText(f'{sensitivity:.3f}')
         self.viewer.set_mouse_sensitivity(sensitivity)
+
+    def _on_roll_correction_changed(self, value: float) -> None:
+        self._manual_roll_correction_deg = float(value)
+        self._apply_view_roll()
+
+    def _on_measurement_mode_changed(self, index: int) -> None:
+        if not hasattr(self, "measurement_mode_combo"):
+            return
+        mode = self.measurement_mode_combo.currentData()
+        if mode not in {
+            self.MEASUREMENT_MODE_AUTO,
+            self.MEASUREMENT_MODE_DEPTH,
+            self.MEASUREMENT_MODE_GROUND,
+            self.MEASUREMENT_MODE_TRIANGULATION,
+        }:
+            mode = self.MEASUREMENT_MODE_AUTO
+        self._measurement_mode = mode
+
+        effective_mode = self._resolve_measurement_mode()
+        is_ground_mode = effective_mode == self.MEASUREMENT_MODE_GROUND
+        if effective_mode != self.MEASUREMENT_MODE_TRIANGULATION and self._triangulation_anchor is not None:
+            self._clear_triangulation_anchor(update_label=False)
+        if hasattr(self, "ground_height_spin"):
+            self.ground_height_spin.setEnabled(is_ground_mode)
+        if hasattr(self, "triangulation_label"):
+            if effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
+                if self._triangulation_anchor is None:
+                    self.triangulation_label.setText("Step 1: click feature in frame A")
+                else:
+                    self.triangulation_label.setText(
+                        f"Anchor frame {self._triangulation_anchor.frame_index} set. "
+                        "Step 2: switch frame and click same feature."
+                    )
+            else:
+                self.triangulation_label.setText("Not active")
+        self._update_depth_source_label()
+
+        if effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
+            self.statusBar().showMessage("Measurement engine: Two-frame triangulation", 2500)
+        elif effective_mode == self.MEASUREMENT_MODE_DEPTH:
+            self.statusBar().showMessage("Measurement engine: Depth map", 2500)
+        else:
+            self.statusBar().showMessage("Measurement engine: Ground plane fallback", 2500)
+
+    def _on_ground_height_changed(self, value: float) -> None:
+        if self._resolve_measurement_mode() == self.MEASUREMENT_MODE_GROUND:
+            self._update_depth_source_label()
+
+    def _current_capture_frame_index(self) -> Optional[int]:
+        if self._active_capture is None or not hasattr(self, "capture_frame_spin"):
+            return None
+        return int(self.capture_frame_spin.value())
+
+    def _clear_triangulation_anchor(self, *, update_label: bool = True) -> None:
+        self._triangulation_anchor = None
+        if update_label and hasattr(self, "triangulation_label"):
+            if self._resolve_measurement_mode() == self.MEASUREMENT_MODE_TRIANGULATION:
+                self.triangulation_label.setText("Step 1: click feature in frame A")
+            else:
+                self.triangulation_label.setText("Not active")
+
+    def _build_ground_plane_measurement(
+        self,
+        theta: float,
+        phi: float,
+        u: int,
+        v: int,
+        width: int,
+        height: int,
+    ) -> tuple[PointMeasurement, np.ndarray, str]:
+        """Compute a fallback ground-plane coordinate for a selected panorama ray."""
+        pose = self._state.metadata.camera_pose
+        camera_height_m = max(0.10, float(self.ground_height_spin.value()))
+        target_alt_m = pose.altitude - camera_height_m
+        pitch_rad = math.radians(self._pose_pitch_deg)
+        roll_rad = math.radians(
+            self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
+        )
+        east, north, up, depth_val = geometry.intersect_ray_with_altitude_plane(
+            theta=theta,
+            phi=phi,
+            bearing_rad=pose.bearing_rad,
+            camera_alt_m=pose.altitude,
+            target_alt_m=target_alt_m,
+            pitch_rad=pitch_rad,
+            roll_rad=roll_rad,
+        )
+        lat, lon, alt = geodesy.enu_to_geodetic(
+            east,
+            north,
+            up,
+            pose.latitude,
+            pose.longitude,
+            pose.altitude,
+        )
+        pixel = PixelSelection(u=u, v=v, width=width, height=height)
+        measurement = PointMeasurement(
+            pixel=pixel,
+            depth_m=depth_val,
+            enu_vector=(east, north, up),
+            geodetic=(lat, lon, alt),
+        )
+        local_vec = geometry.spherical_direction(theta, phi) * depth_val
+        source = f"Ground plane estimate (camera height {camera_height_m:.2f} m)"
+        return measurement, local_vec, source
+
+    def _triangulate_with_direction_variants(
+        self,
+        origin_a: np.ndarray,
+        direction_a: np.ndarray,
+        origin_b: np.ndarray,
+        direction_b: np.ndarray,
+    ) -> tuple[np.ndarray, float, float, float, int]:
+        """Triangulate while tolerating 180-degree ray-direction ambiguity."""
+        candidates: list[tuple[int, float, np.ndarray, float, float]] = []
+        for sign_a in (1.0, -1.0):
+            for sign_b in (1.0, -1.0):
+                try:
+                    point, residual_m, range_a_m, range_b_m = geometry.triangulate_rays_closest_point(
+                        origin_a=origin_a,
+                        direction_a=direction_a * sign_a,
+                        origin_b=origin_b,
+                        direction_b=direction_b * sign_b,
+                    )
+                except ValueError:
+                    continue
+                positive_count = int(range_a_m > 0.0) + int(range_b_m > 0.0)
+                candidates.append((positive_count, residual_m, point, range_a_m, range_b_m))
+
+        if not candidates:
+            raise ValueError("Triangulation failed for all ray-direction variants.")
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        positive_count, residual_m, point, range_a_m, range_b_m = candidates[0]
+        return point, residual_m, range_a_m, range_b_m, positive_count
+
     def _refresh_viewer_image(self, reset_orientation: bool = True) -> None:
 
 
@@ -1763,11 +2150,6 @@ class MainWindow(QMainWindow):
         height, width = image.shape[:2]
         qimage = QImage(image.data, width, height, width * 3, QImage.Format.Format_RGB888)
         return QPixmap.fromImage(qimage.copy())
-        value = max(1, min(int(value), 10))
-        sensitivity = value / 1000.0
-        if hasattr(self, 'mouse_sensitivity_value_label'):
-            self.mouse_sensitivity_value_label.setText(f"{sensitivity:.3f}")
-        self.viewer.set_mouse_sensitivity(sensitivity)
 
     def _on_invert_x_toggled(self, checked: bool) -> None:
         self.viewer.set_invert_x(checked)
@@ -1870,54 +2252,6 @@ class MainWindow(QMainWindow):
         self._update_reset_button_state()
         self.statusBar().showMessage("View reset to front/horizon", 2500)
 
-    def _prompt_stereo_depth(self) -> None:
-
-
-
-        detection = self._state.stereo_detection
-
-
-
-        if not (detection and detection.is_stereo) or self._state.has_depth:
-
-
-
-            return
-
-
-
-        reply = QMessageBox.question(
-
-
-
-            self,
-
-
-
-            "Stereo Panorama Detected",
-
-
-
-            "A stereo panorama was detected. Would you like to generate a depth map now...",
-
-
-
-        )
-
-
-
-        if reply == QMessageBox.StandardButton.Yes:
-
-
-
-            self._on_generate_depth_clicked()
-
-
-
-
-
-
-
     def _validate_depth_alignment(self) -> None:
 
 
@@ -1988,216 +2322,321 @@ class MainWindow(QMainWindow):
 
         self.hover_label.setText(f"...={theta_deg:.2f}deg, f={phi_deg:.2f}deg")
 
-
-
-
-
-
-
     def _on_point_selected(self, theta: float, phi: float) -> None:
-
-
-
         if not self._state.has_image:
-
-
-
             QMessageBox.information(self, "No Panorama", "Load a panorama image before selecting points.")
-
-
-
             return
-
-
-
-        if not self._state.has_depth:
-
-
-
-            QMessageBox.warning(self, "No Depth Map", "Load or generate a depth map to enable measurements.")
-
-
-
-            return
-
-
-
-
-
-
 
         image = self._state.ensure_image()
-
-
-
-        depth = self._state.ensure_depth()
-
-
-
         height, width, _ = image.shape
-
-
-
         u, v = geometry.angles_to_pixel(theta, phi, width, height)
 
+        effective_mode = self._resolve_measurement_mode()
 
-
-
-
-
-
-        depth_val = float(depth[v, u])
-
-
-
-        if not math.isfinite(depth_val) or depth_val <= 0.0:
-
-
-
-            QMessageBox.warning(self, "Invalid Depth", "Selected pixel does not have a valid depth value.")
-
-
-
+        if effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
+            self._handle_two_frame_triangulation_selection(theta, phi, u, v, width, height)
             return
 
-
-
-
-
-
-
         pose = self._state.metadata.camera_pose
-
-
-
-        east, north, up, _, _ = geometry.enu_vector_from_pixel(
-
-
-
-            u,
-
-
-
-            v,
-
-
-
-            width,
-
-
-
-            height,
-
-
-
-            depth_val,
-
-
-
-            pose.bearing_rad,
-
-
-
+        pitch_rad = math.radians(self._pose_pitch_deg)
+        roll_rad = math.radians(
+            self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
         )
 
+        depth_val: float
+        east: float
+        north: float
+        up: float
 
+        if effective_mode == self.MEASUREMENT_MODE_GROUND:
+            try:
+                measurement, local_vec, source = self._build_ground_plane_measurement(
+                    theta,
+                    phi,
+                    u,
+                    v,
+                    width,
+                    height,
+                )
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Ground Plane Intersection",
+                    f"{exc}\nTry a point likely on the ground, or move to another frame for triangulation.",
+                )
+                return
+            self.measurement_model.add_measurement(measurement)
+            self._update_selection_labels(measurement, local_vec)
+            self.depth_source_label.setText(source)
+            message = "Point measured (ground-plane estimate)"
+            duration = 2500
+            if self.pose_warning_label.isVisible():
+                message += " (default camera pose - update lat/lon/alt for accuracy)"
+                duration = 5000
+            self.statusBar().showMessage(message, duration)
+            return
+        else:
+            if not self._state.has_depth:
+                QMessageBox.warning(
+                    self,
+                    "No Depth Map",
+                    "Depth map unavailable. Automatic mode will use triangulation if capture frames are available.",
+                )
+                return
+            depth = self._state.ensure_depth()
+            depth_val = float(depth[v, u])
+            if not math.isfinite(depth_val) or depth_val <= 0.0:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Depth",
+                    "Selected pixel does not have a valid depth value.",
+                )
+                return
+            east, north, up, _, _ = geometry.enu_vector_from_pixel(
+                u,
+                v,
+                width,
+                height,
+                depth_val,
+                pose.bearing_rad,
+                pitch_rad=pitch_rad,
+                roll_rad=roll_rad,
+            )
+            source = self._state.depth_source or "Depth map"
 
         local_vec = geometry.spherical_direction(theta, phi) * depth_val
-
-
-
-
-
-
-
         lat, lon, alt = geodesy.enu_to_geodetic(
-
-
-
             east,
-
-
-
             north,
-
-
-
             up,
-
-
-
             pose.latitude,
-
-
-
             pose.longitude,
-
-
-
             pose.altitude,
-
-
-
         )
-
-
-
-
-
-
 
         pixel = PixelSelection(u=u, v=v, width=width, height=height)
-
-
-
         measurement = PointMeasurement(
-
-
-
             pixel=pixel,
-
-
-
             depth_m=depth_val,
-
-
-
             enu_vector=(east, north, up),
-
-
-
             geodetic=(lat, lon, alt),
-
-
-
         )
 
-
-
-
-
-
-
         self.measurement_model.add_measurement(measurement)
-
-
-
         self._update_selection_labels(measurement, local_vec)
-
-
+        self.depth_source_label.setText(source)
 
         message = "Point measured"
         duration = 2500
+        if effective_mode == self.MEASUREMENT_MODE_GROUND:
+            message += " (ground-plane estimate)"
         if self.pose_warning_label.isVisible():
             message += " (default camera pose - update lat/lon/alt for accuracy)"
             duration = 5000
         self.statusBar().showMessage(message, duration)
 
+    def _handle_two_frame_triangulation_selection(
+        self,
+        theta: float,
+        phi: float,
+        u: int,
+        v: int,
+        width: int,
+        height: int,
+    ) -> None:
+        """Handle one click in two-frame triangulation mode."""
+        if self._active_capture is None or self._active_capture.frame_count < 2:
+            QMessageBox.warning(
+                self,
+                "Two-Frame Triangulation",
+                "Triangulation requires a loaded capture folder with at least 2 frames.",
+            )
+            return
 
+        frame_index = self._current_capture_frame_index()
+        if frame_index is None:
+            QMessageBox.warning(self, "Two-Frame Triangulation", "Unable to resolve active frame index.")
+            return
 
+        pose = self._state.metadata.camera_pose
+        pose_copy = CameraPose(
+            latitude=pose.latitude,
+            longitude=pose.longitude,
+            altitude=pose.altitude,
+            bearing=pose.bearing,
+        )
+        pitch_deg = float(self._pose_pitch_deg)
+        roll_deg = float(self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg)
 
+        if self._triangulation_anchor is None or frame_index == self._triangulation_anchor.frame_index:
+            self._triangulation_anchor = TriangulationAnchor(
+                frame_index=frame_index,
+                pose=pose_copy,
+                theta=theta,
+                phi=phi,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+            )
+            if hasattr(self, "triangulation_label"):
+                self.triangulation_label.setText(
+                    f"Anchor frame {frame_index} set. Step 2: switch frame and click same feature."
+                )
+            provisional_note = "Coordinate pending second frame click."
+            try:
+                provisional_measurement, provisional_vec, _ = self._build_ground_plane_measurement(
+                    theta,
+                    phi,
+                    u,
+                    v,
+                    width,
+                    height,
+                )
+                self.measurement_model.add_measurement(provisional_measurement)
+                self._update_selection_labels(provisional_measurement, provisional_vec)
+                self.depth_source_label.setText("Triangulation anchor (provisional ground estimate)")
+                provisional_note = "Provisional coordinate shown; click same feature in another frame to refine."
+            except ValueError:
+                # Ground fallback is not always possible (e.g. sky rays). Keep anchor and continue.
+                pass
+            self.statusBar().showMessage(
+                f"Triangulation anchor set at frame {frame_index}. {provisional_note}",
+                4500,
+            )
+            return
 
+        anchor = self._triangulation_anchor
+        assert anchor is not None  # for type checkers
 
+        baseline_e, baseline_n, baseline_u = geodesy.geodetic_to_enu(
+            pose_copy.latitude,
+            pose_copy.longitude,
+            pose_copy.altitude,
+            anchor.pose.latitude,
+            anchor.pose.longitude,
+            anchor.pose.altitude,
+        )
+        baseline = np.array([baseline_e, baseline_n, baseline_u], dtype=np.float64)
+
+        direction_a = np.array(
+            geometry.enu_vector_from_angles(
+                anchor.theta,
+                anchor.phi,
+                1.0,
+                anchor.pose.bearing_rad,
+                pitch_rad=math.radians(anchor.pitch_deg),
+                roll_rad=math.radians(anchor.roll_deg),
+            ),
+            dtype=np.float64,
+        )
+        direction_b = np.array(
+            geometry.enu_vector_from_angles(
+                theta,
+                phi,
+                1.0,
+                pose_copy.bearing_rad,
+                pitch_rad=math.radians(pitch_deg),
+                roll_rad=math.radians(roll_deg),
+            ),
+            dtype=np.float64,
+        )
+
+        baseline_m = float(np.linalg.norm(baseline))
+        if baseline_m < 0.25:
+            self.statusBar().showMessage(
+                "Triangulation baseline too small. Move to a farther frame for accurate coordinates.",
+                4000,
+            )
+            return
+
+        try:
+            (
+                point_anchor_enu,
+                residual_m,
+                range_anchor_m,
+                range_current_m,
+                positive_count,
+            ) = self._triangulate_with_direction_variants(
+                origin_a=np.zeros(3, dtype=np.float64),
+                direction_a=direction_a,
+                origin_b=baseline,
+                direction_b=direction_b,
+            )
+        except ValueError as exc:
+            QMessageBox.warning(self, "Two-Frame Triangulation", str(exc))
+            return
+
+        if positive_count < 2:
+            try:
+                fallback_measurement, fallback_vec, _ = self._build_ground_plane_measurement(
+                    theta,
+                    phi,
+                    u,
+                    v,
+                    width,
+                    height,
+                )
+                self.measurement_model.add_measurement(fallback_measurement)
+                self._update_selection_labels(fallback_measurement, fallback_vec)
+                self.depth_source_label.setText("Triangulation unstable (fallback ground estimate)")
+                self.statusBar().showMessage(
+                    "Triangulation unstable for this pair. Showing fallback estimate; choose a farther frame.",
+                    4500,
+                )
+                return
+            except ValueError:
+                QMessageBox.warning(
+                    self,
+                    "Two-Frame Triangulation",
+                    "Triangulation is unstable for this point. Try a farther frame or click a stronger feature.",
+                )
+                return
+
+        lat, lon, alt = geodesy.enu_to_geodetic(
+            point_anchor_enu[0],
+            point_anchor_enu[1],
+            point_anchor_enu[2],
+            anchor.pose.latitude,
+            anchor.pose.longitude,
+            anchor.pose.altitude,
+        )
+        east_cur, north_cur, up_cur = geodesy.geodetic_to_enu(
+            lat,
+            lon,
+            alt,
+            pose_copy.latitude,
+            pose_copy.longitude,
+            pose_copy.altitude,
+        )
+
+        pixel = PixelSelection(u=u, v=v, width=width, height=height)
+        measurement = PointMeasurement(
+            pixel=pixel,
+            depth_m=range_current_m,
+            enu_vector=(east_cur, north_cur, up_cur),
+            geodetic=(lat, lon, alt),
+        )
+        local_vec = geometry.spherical_direction(theta, phi) * range_current_m
+
+        self.measurement_model.add_measurement(measurement)
+        self._update_selection_labels(measurement, local_vec)
+        self.depth_source_label.setText(
+            "Two-frame triangulation "
+            f"(residual {residual_m:.2f} m, baseline {baseline_m:.2f} m)"
+        )
+        if hasattr(self, "triangulation_label"):
+            self.triangulation_label.setText(
+                f"Anchor frame {anchor.frame_index} active. Click another frame to triangulate more points."
+            )
+
+        message = (
+            f"Triangulated point from frames {anchor.frame_index} -> {frame_index} "
+            f"(residual {residual_m:.2f} m)"
+        )
+        if residual_m > 2.0:
+            message += " [high residual]"
+        if self.pose_warning_label.isVisible():
+            message += " (default camera pose - update lat/lon/alt for accuracy)"
+        self.statusBar().showMessage(message, 5000)
 
     def _update_selection_labels(self, measurement: PointMeasurement, local_vec: np.ndarray) -> None:
         self.pixel_label.setText(f"({measurement.pixel.u}, {measurement.pixel.v})")
