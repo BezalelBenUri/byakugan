@@ -48,7 +48,7 @@ from loguru import logger
 
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QImage, QPixmap
+from PyQt6.QtGui import QAction, QGuiApplication, QImage, QKeySequence, QPixmap, QShortcut
 
 
 
@@ -305,6 +305,9 @@ class MainWindow(QMainWindow):
         self._manual_roll_correction_deg = 0.0
         self._measurement_mode = self.MEASUREMENT_MODE_AUTO
         self._triangulation_anchor: Optional[TriangulationAnchor] = None
+        self._measurement_history: list[PointMeasurement] = []
+        self._measurement_marker_angles: list[tuple[float, float]] = []
+        self._measurement_marker_frames: list[Optional[int]] = []
 
         self._build_ui()
 
@@ -756,6 +759,9 @@ class MainWindow(QMainWindow):
 
 
 
+        self.measurement_count_label = QLabel("Saved Points: 0")
+        self.measurement_count_label.setStyleSheet("color: #8aa; font-size: 11px;")
+
         self.measurement_table = QTableView()
 
 
@@ -768,11 +774,11 @@ class MainWindow(QMainWindow):
 
 
 
-        self.measurement_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.measurement_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
 
 
 
-        self.measurement_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.measurement_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
 
 
@@ -781,6 +787,9 @@ class MainWindow(QMainWindow):
 
 
         self.measurement_table.verticalHeader().setVisible(False)
+
+        self._measurement_copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, self.measurement_table)
+        self._measurement_copy_shortcut.activated.connect(self._copy_selected_measurement_cells)
 
 
 
@@ -844,14 +853,11 @@ class MainWindow(QMainWindow):
 
 
 
+        vbox.addWidget(self.measurement_count_label)
         vbox.addWidget(self.measurement_table, stretch=1)
 
-
-
         vbox.addLayout(controls)
-
-
-
+        self._update_measurement_count_label()
         return group
 
 
@@ -1118,6 +1124,7 @@ class MainWindow(QMainWindow):
     def _nctech_capture_loaded(self, capture: NCTechStitchedCapture) -> None:
         self._active_capture = capture
         self._capture_base_roll_offset_deg = 0.0
+        self._clear_measurement_history()
         self._clear_triangulation_anchor(update_label=True)
         self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
         self._capture_spin_block = True
@@ -1175,7 +1182,7 @@ class MainWindow(QMainWindow):
 
         self.image_path_display.setText(str(frame.image_path))
         self.depth_path_display.setText("[None]")
-        self.measurement_model.clear()
+        self._sync_viewer_measurement_markers()
         self._needs_reorient = False
 
         self._update_format_status()
@@ -1199,6 +1206,7 @@ class MainWindow(QMainWindow):
         self._pose_pitch_deg = 0.0
         self._pose_roll_deg = 0.0
         self._apply_view_roll()
+        self._sync_viewer_measurement_markers()
         self._clear_triangulation_anchor()
         self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
         self._capture_spin_block = True
@@ -1535,7 +1543,7 @@ class MainWindow(QMainWindow):
 
 
 
-        self.measurement_model.clear()
+        self._clear_measurement_history()
 
 
 
@@ -1699,7 +1707,7 @@ class MainWindow(QMainWindow):
 
         self.image_path_display.setText(str(path))
         self.depth_path_display.setText("[None]")
-        self.measurement_model.clear()
+        self._clear_measurement_history()
         self._needs_reorient = False
 
         self._update_format_status()
@@ -1960,6 +1968,79 @@ class MainWindow(QMainWindow):
             else:
                 self.triangulation_label.setText("Not active")
 
+    def _append_measurement(
+        self,
+        measurement: PointMeasurement,
+        *,
+        marker_theta: float,
+        marker_phi: float,
+        marker_frame_index: Optional[int] = None,
+    ) -> None:
+        """Append one measured point and keep marker/table state in sync."""
+        self._measurement_history.append(measurement)
+        self._measurement_marker_angles.append((marker_theta, marker_phi))
+        self._measurement_marker_frames.append(marker_frame_index)
+        self.measurement_model.add_measurement(measurement)
+        self._update_measurement_count_label()
+        self._sync_viewer_measurement_markers()
+        if hasattr(self, "measurement_table"):
+            self.measurement_table.resizeColumnsToContents()
+            self.measurement_table.scrollToBottom()
+
+    def _clear_measurement_history(self) -> None:
+        """Clear all persisted measurements and viewer markers."""
+        self._measurement_history.clear()
+        self._measurement_marker_angles.clear()
+        self._measurement_marker_frames.clear()
+        self.measurement_model.clear()
+        self._update_measurement_count_label()
+        self._sync_viewer_measurement_markers()
+
+    def _update_measurement_count_label(self) -> None:
+        if hasattr(self, "measurement_count_label"):
+            self.measurement_count_label.setText(f"Saved Points: {len(self._measurement_history)}")
+
+    def _sync_viewer_measurement_markers(self) -> None:
+        if not hasattr(self, "viewer"):
+            return
+        current_frame_index = self._current_capture_frame_index() if self._active_capture is not None else None
+        markers: list[tuple[float, float, str]] = []
+        for theta_phi, frame_index in zip(self._measurement_marker_angles, self._measurement_marker_frames):
+            if frame_index is not None and frame_index != current_frame_index:
+                continue
+            theta, phi = theta_phi
+            markers.append((theta, phi, f"pt{len(markers) + 1}"))
+        self.viewer.set_measurement_markers(markers)
+
+    def _copy_selected_measurement_cells(self) -> None:
+        """Copy selected table cells as TSV for spreadsheet-friendly paste."""
+        if not hasattr(self, "measurement_table"):
+            return
+        indexes = self.measurement_table.selectedIndexes()
+        if not indexes:
+            return
+        indexes.sort(key=lambda idx: (idx.row(), idx.column()))
+
+        by_row: dict[int, dict[int, str]] = {}
+        min_col = indexes[0].column()
+        max_col = indexes[0].column()
+        for index in indexes:
+            row = index.row()
+            col = index.column()
+            min_col = min(min_col, col)
+            max_col = max(max_col, col)
+            value = index.data(Qt.ItemDataRole.DisplayRole)
+            by_row.setdefault(row, {})[col] = "" if value is None else str(value)
+
+        lines: list[str] = []
+        for row in sorted(by_row):
+            cols = by_row[row]
+            line = [cols.get(col, "") for col in range(min_col, max_col + 1)]
+            lines.append("\t".join(line))
+
+        QGuiApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage(f"Copied {len(indexes)} cell(s)", 1500)
+
     def _build_ground_plane_measurement(
         self,
         theta: float,
@@ -2042,6 +2123,7 @@ class MainWindow(QMainWindow):
             return
         image = self._state.ensure_image()
         self.viewer.set_panorama(image, reset_orientation=reset_orientation)
+        self._sync_viewer_measurement_markers()
         self.viewer.update()
 
     def _update_format_status(self) -> None:
@@ -2330,6 +2412,7 @@ class MainWindow(QMainWindow):
         image = self._state.ensure_image()
         height, width, _ = image.shape
         u, v = geometry.angles_to_pixel(theta, phi, width, height)
+        marker_frame_index = self._current_capture_frame_index()
 
         effective_mode = self._resolve_measurement_mode()
 
@@ -2365,7 +2448,12 @@ class MainWindow(QMainWindow):
                     f"{exc}\nTry a point likely on the ground, or move to another frame for triangulation.",
                 )
                 return
-            self.measurement_model.add_measurement(measurement)
+            self._append_measurement(
+                measurement,
+                marker_theta=theta,
+                marker_phi=phi,
+                marker_frame_index=marker_frame_index,
+            )
             self._update_selection_labels(measurement, local_vec)
             self.depth_source_label.setText(source)
             message = "Point measured (ground-plane estimate)"
@@ -2422,7 +2510,12 @@ class MainWindow(QMainWindow):
             geodetic=(lat, lon, alt),
         )
 
-        self.measurement_model.add_measurement(measurement)
+        self._append_measurement(
+            measurement,
+            marker_theta=theta,
+            marker_phi=phi,
+            marker_frame_index=marker_frame_index,
+        )
         self._update_selection_labels(measurement, local_vec)
         self.depth_source_label.setText(source)
 
@@ -2491,7 +2584,12 @@ class MainWindow(QMainWindow):
                     width,
                     height,
                 )
-                self.measurement_model.add_measurement(provisional_measurement)
+                self._append_measurement(
+                    provisional_measurement,
+                    marker_theta=theta,
+                    marker_phi=phi,
+                    marker_frame_index=frame_index,
+                )
                 self._update_selection_labels(provisional_measurement, provisional_vec)
                 self.depth_source_label.setText("Triangulation anchor (provisional ground estimate)")
                 provisional_note = "Provisional coordinate shown; click same feature in another frame to refine."
@@ -2575,7 +2673,12 @@ class MainWindow(QMainWindow):
                     width,
                     height,
                 )
-                self.measurement_model.add_measurement(fallback_measurement)
+                self._append_measurement(
+                    fallback_measurement,
+                    marker_theta=theta,
+                    marker_phi=phi,
+                    marker_frame_index=frame_index,
+                )
                 self._update_selection_labels(fallback_measurement, fallback_vec)
                 self.depth_source_label.setText("Triangulation unstable (fallback ground estimate)")
                 self.statusBar().showMessage(
@@ -2617,7 +2720,12 @@ class MainWindow(QMainWindow):
         )
         local_vec = geometry.spherical_direction(theta, phi) * range_current_m
 
-        self.measurement_model.add_measurement(measurement)
+        self._append_measurement(
+            measurement,
+            marker_theta=theta,
+            marker_phi=phi,
+            marker_frame_index=frame_index,
+        )
         self._update_selection_labels(measurement, local_vec)
         self.depth_source_label.setText(
             "Two-frame triangulation "
@@ -2948,7 +3056,7 @@ class MainWindow(QMainWindow):
 
 
 
-            self.measurement_model.clear()
+            self._clear_measurement_history()
 
 
 
