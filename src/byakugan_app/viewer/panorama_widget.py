@@ -14,36 +14,32 @@ from OpenGL.GL import (
     GL_MODELVIEW,
     GL_PROJECTION,
     GL_RGB,
+    GL_TRIANGLE_STRIP,
     GL_TEXTURE_2D,
     GL_TEXTURE_MAG_FILTER,
     GL_TEXTURE_MIN_FILTER,
     GL_UNSIGNED_BYTE,
+    glBegin,
     glBindTexture,
     glClear,
     glClearColor,
     glDeleteTextures,
     glDisable,
+    glEnd,
     glEnable,
     glGenTextures,
     glLoadIdentity,
     glMatrixMode,
+    glRotatef,
+    glTexCoord2f,
     glTexImage2D,
     glTexParameteri,
+    glVertex3f,
     glViewport,
 )
 from OpenGL.GLU import (
-    GLU_FILL,
-    GLU_INSIDE,
-    GLU_SMOOTH,
-    gluDeleteQuadric,
     gluLookAt,
-    gluNewQuadric,
     gluPerspective,
-    gluQuadricDrawStyle,
-    gluQuadricNormals,
-    gluQuadricOrientation,
-    gluQuadricTexture,
-    gluSphere,
 )
 from PyQt6.QtCore import QPointF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPen, QWheelEvent
@@ -64,16 +60,18 @@ class PanoramaWidget(QOpenGLWidget):
         self._image: Optional[np.ndarray] = None
         self._texture_id: Optional[int] = None
         self._pending_upload = False
-        self._quadric = None
+        self._sphere_lon_segments = 128
+        self._sphere_lat_segments = 64
 
         self._yaw = 0.0
         self._pitch = 0.0
         self._initial_yaw = 0.0
         self._bearing_reference = 0.0
-        self._yaw_offset = math.pi / 2.0
+        self._yaw_offset = math.pi
         self._fov_y = math.radians(75.0)
         self._min_fov = math.radians(20.0)
         self._max_fov = math.radians(120.0)
+        self._view_roll = 0.0
         self._min_pitch = -math.pi / 2 + 1e-3
         self._max_pitch = math.pi / 2 - 1e-3
 
@@ -153,11 +151,6 @@ class PanoramaWidget(QOpenGLWidget):
     def initializeGL(self) -> None:  # noqa: N802
         glClearColor(0.03, 0.04, 0.06, 1.0)
         glEnable(GL_DEPTH_TEST)
-        self._quadric = gluNewQuadric()
-        gluQuadricTexture(self._quadric, True)
-        gluQuadricNormals(self._quadric, GLU_SMOOTH)
-        gluQuadricDrawStyle(self._quadric, GLU_FILL)
-        gluQuadricOrientation(self._quadric, GLU_INSIDE)
 
     def resizeGL(self, width: int, height: int) -> None:  # noqa: N802
         glViewport(0, 0, width, height)
@@ -172,7 +165,10 @@ class PanoramaWidget(QOpenGLWidget):
         glMatrixMode(GL_MODELVIEW)
         glLoadIdentity()
         dir_x, dir_y, dir_z = self._orientation_vector()
-        gluLookAt(0.0, 0.0, 0.0, dir_x, dir_y, dir_z, 0.0, 1.0, 0.0)
+        gluLookAt(0.0, 0.0, 0.0, dir_x, dir_y, dir_z, 0.0, 0.0, 1.0)
+        if abs(self._view_roll) > 1e-9:
+            # Apply display roll in eye space to keep drag controls intuitive.
+            glRotatef(float(math.degrees(self._view_roll)), 0.0, 0.0, 1.0)
 
         if self._image is None:
             return
@@ -181,7 +177,7 @@ class PanoramaWidget(QOpenGLWidget):
 
         glEnable(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, self._texture_id or 0)
-        gluSphere(self._quadric, 1.0, 128, 64)
+        self._draw_textured_sphere(radius=1.0)
         glBindTexture(GL_TEXTURE_2D, 0)
         glDisable(GL_TEXTURE_2D)
 
@@ -206,8 +202,9 @@ class PanoramaWidget(QOpenGLWidget):
 
         if self._show_orientation_overlay:
             yaw_deg, pitch_deg = self.orientation_degrees()
+            roll_deg = math.degrees(self._view_roll)
             primary = (
-                f"Yaw {yaw_deg:+06.1f} deg | Pitch {pitch_deg:+06.1f} deg | "
+                f"Yaw {yaw_deg:+06.1f} deg | Pitch {pitch_deg:+06.1f} deg | Roll {roll_deg:+06.1f} deg | "
                 f"dx {self._last_drag_dx:+06.1f} | dy {self._last_drag_dy:+06.1f}"
             )
             overlay_lines = [primary]
@@ -335,8 +332,21 @@ class PanoramaWidget(QOpenGLWidget):
         aspect = width / height
         fov_x = 2.0 * math.atan(math.tan(fov_y / 2.0) * aspect)
 
-        theta = self._normalize_angle(self._yaw + (x_norm - 0.5) * fov_x)
-        phi = self._pitch + (0.5 - y_norm) * fov_y
+        delta_x = (x_norm - 0.5) * fov_x
+        delta_y = (0.5 - y_norm) * fov_y
+
+        # Undo view roll before projecting to spherical angles so picking and
+        # hover readouts stay aligned with what the user sees.
+        if abs(self._view_roll) > 1e-9:
+            cos_r = math.cos(self._view_roll)
+            sin_r = math.sin(self._view_roll)
+            delta_x, delta_y = (
+                (delta_x * cos_r) + (delta_y * sin_r),
+                (-delta_x * sin_r) + (delta_y * cos_r),
+            )
+
+        theta = self._normalize_angle(self._yaw + self._yaw_offset + delta_x)
+        phi = self._pitch + delta_y
         phi = float(np.clip(phi, self._min_pitch, self._max_pitch))
         return theta, phi
 
@@ -371,9 +381,6 @@ class PanoramaWidget(QOpenGLWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._delete_texture()
-        if self._quadric is not None:
-            gluDeleteQuadric(self._quadric)
-            self._quadric = None
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
@@ -399,10 +406,52 @@ class PanoramaWidget(QOpenGLWidget):
         yaw = self._yaw + self._yaw_offset
         cos_pitch = math.cos(self._pitch)
         return (
-            -math.sin(yaw) * cos_pitch,
+            cos_pitch * math.cos(yaw),
+            cos_pitch * math.sin(yaw),
             math.sin(self._pitch),
-            -math.cos(yaw) * cos_pitch,
         )
+
+    def _draw_textured_sphere(self, radius: float) -> None:
+        """Render a sphere with explicit equirectangular texture coordinates.
+
+        The mapping is deterministic and independent of GLU quadric conventions.
+        """
+        lon_steps = self._sphere_lon_segments
+        lat_steps = self._sphere_lat_segments
+
+        for lat_idx in range(lat_steps):
+            v0 = lat_idx / lat_steps
+            v1 = (lat_idx + 1) / lat_steps
+            phi0 = (math.pi / 2.0) - (v0 * math.pi)
+            phi1 = (math.pi / 2.0) - (v1 * math.pi)
+            cos_phi0 = math.cos(phi0)
+            cos_phi1 = math.cos(phi1)
+            sin_phi0 = math.sin(phi0)
+            sin_phi1 = math.sin(phi1)
+
+            glBegin(GL_TRIANGLE_STRIP)
+            for lon_idx in range(lon_steps + 1):
+                u = lon_idx / lon_steps
+                theta = u * (2.0 * math.pi)
+                cos_theta = math.cos(theta)
+                sin_theta = math.sin(theta)
+
+                # First row vertex
+                x0 = radius * cos_phi0 * cos_theta
+                y0 = radius * cos_phi0 * sin_theta
+                z0 = radius * sin_phi0
+
+                # Second row vertex
+                x1 = radius * cos_phi1 * cos_theta
+                y1 = radius * cos_phi1 * sin_theta
+                z1 = radius * sin_phi1
+
+                # Reverse winding for inside view.
+                glTexCoord2f(u, v1)
+                glVertex3f(x1, y1, z1)
+                glTexCoord2f(u, v0)
+                glVertex3f(x0, y0, z0)
+            glEnd()
 
     def _update_initial_orientation(self) -> None:
         self._initial_yaw = self._normalize_angle(-self._bearing_reference)
@@ -433,4 +482,9 @@ class PanoramaWidget(QOpenGLWidget):
         self._overlay_metadata = metadata.strip()
         if self._show_orientation_overlay:
             self.update()
+
+    def set_view_roll_degrees(self, roll_deg: float) -> None:
+        """Apply a roll correction to the rendered panorama view."""
+        self._view_roll = math.radians(float(roll_deg))
+        self.update()
 
