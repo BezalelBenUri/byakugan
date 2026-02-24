@@ -91,7 +91,8 @@ class PanoramaWidget(QOpenGLWidget):
 
         self._overlay_metadata = ""
 
-        self._selection_point: Optional[QPointF] = None
+        self._selection_angles: Optional[tuple[float, float]] = None
+        self._measurement_markers: list[tuple[float, float, str]] = []
         self._instructions_visible = True
         self._instruction_text = (
             "Drag left/right to rotate 360 deg yaw. Drag up/down to tilt. "
@@ -108,6 +109,7 @@ class PanoramaWidget(QOpenGLWidget):
         if image.shape[2] != 3:
             raise ValueError("Panorama image must be an RGB image")
         self._image = np.ascontiguousarray(image)
+        self._selection_angles = None
         self._pending_upload = True
         if reset_orientation:
             self.reset_view()
@@ -116,6 +118,7 @@ class PanoramaWidget(QOpenGLWidget):
 
     def clear_panorama(self) -> None:
         self._image = None
+        self._selection_angles = None
         self._delete_texture()
         self.update()
 
@@ -138,7 +141,7 @@ class PanoramaWidget(QOpenGLWidget):
     def reset_view(self) -> None:
         self._yaw = self._normalize_angle(self._initial_yaw)
         self._pitch = 0.0
-        self._selection_point = None
+        self._selection_angles = None
         self._instructions_visible = True
         self._last_drag_dx = 0.0
         self._last_drag_dy = 0.0
@@ -191,14 +194,18 @@ class PanoramaWidget(QOpenGLWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawText(16, 28, self._instruction_text)
 
-        if self._selection_point is not None:
-            pen = QPen(Qt.GlobalColor.white)
-            pen.setWidth(2)
-            painter.setPen(pen)
-            x = self._selection_point.x()
-            y = self._selection_point.y()
-            painter.drawLine(int(x) - 15, int(y), int(x) + 15, int(y))
-            painter.drawLine(int(x), int(y) - 15, int(x), int(y) + 15)
+        if self._selection_angles is not None:
+            selection_point = self._screen_from_angles(*self._selection_angles)
+            if selection_point is not None:
+                pen = QPen(Qt.GlobalColor.white)
+                pen.setWidth(2)
+                painter.setPen(pen)
+                x = selection_point.x()
+                y = selection_point.y()
+                painter.drawLine(int(x) - 15, int(y), int(x) + 15, int(y))
+                painter.drawLine(int(x), int(y) - 15, int(x), int(y) + 15)
+
+        self._draw_measurement_markers(painter)
 
         if self._show_orientation_overlay:
             yaw_deg, pitch_deg = self.orientation_degrees()
@@ -275,8 +282,8 @@ class PanoramaWidget(QOpenGLWidget):
         if event.button() == Qt.MouseButton.LeftButton:
             delta = event.position() - self._press_pos
             if delta.manhattanLength() < 6:
-                self._selection_point = QPointF(event.position())
                 theta, phi = self._angles_from_screen(event.position().x(), event.position().y())
+                self._selection_angles = (theta, phi)
                 self.pointSelected.emit(theta, phi)
                 self.update()
         super().mouseReleaseEvent(event)
@@ -323,32 +330,146 @@ class PanoramaWidget(QOpenGLWidget):
 
     # ------------------------------------------------------------------
     def _angles_from_screen(self, x: float, y: float) -> Tuple[float, float]:
+        """Convert viewport coordinates to panorama angles via inverse projection."""
         width = max(1.0, float(self.width()))
         height = max(1.0, float(self.height()))
-        x_norm = x / width
-        y_norm = y / height
-
-        fov_y = self._fov_y
         aspect = width / height
-        fov_x = 2.0 * math.atan(math.tan(fov_y / 2.0) * aspect)
 
-        delta_x = (x_norm - 0.5) * fov_x
-        delta_y = (0.5 - y_norm) * fov_y
+        x_ndc = ((x / width) * 2.0) - 1.0
+        y_ndc = 1.0 - ((y / height) * 2.0)
 
-        # Undo view roll before projecting to spherical angles so picking and
-        # hover readouts stay aligned with what the user sees.
+        tan_half_y = math.tan(self._fov_y / 2.0)
+        tan_half_x = tan_half_y * aspect
+        if tan_half_x <= 1e-9 or tan_half_y <= 1e-9:
+            return self._normalize_angle(self._yaw + self._yaw_offset), float(self._pitch)
+
+        x_cam = x_ndc * tan_half_x
+        y_cam = y_ndc * tan_half_y
+
+        # Undo display roll to recover the camera-space ray used for picking.
         if abs(self._view_roll) > 1e-9:
             cos_r = math.cos(self._view_roll)
             sin_r = math.sin(self._view_roll)
-            delta_x, delta_y = (
-                (delta_x * cos_r) + (delta_y * sin_r),
-                (-delta_x * sin_r) + (delta_y * cos_r),
+            x_cam, y_cam = (
+                (x_cam * cos_r) + (y_cam * sin_r),
+                (-x_cam * sin_r) + (y_cam * cos_r),
             )
 
-        theta = self._normalize_angle(self._yaw + self._yaw_offset + delta_x)
-        phi = self._pitch + delta_y
+        basis = self._camera_basis()
+        if basis is None:
+            return self._normalize_angle(self._yaw + self._yaw_offset), float(self._pitch)
+        forward, right, up = basis
+
+        direction = (x_cam * right) + (y_cam * up) + forward
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            return self._normalize_angle(self._yaw + self._yaw_offset), float(self._pitch)
+        direction /= norm
+
+        theta = self._normalize_angle(math.atan2(float(direction[1]), float(direction[0])))
+        phi = math.asin(float(np.clip(direction[2], -1.0, 1.0)))
         phi = float(np.clip(phi, self._min_pitch, self._max_pitch))
         return theta, phi
+
+    def _camera_basis(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Build the current camera basis vectors (forward, right, up)."""
+        forward = np.array(self._orientation_vector(), dtype=np.float64)
+        forward_norm = float(np.linalg.norm(forward))
+        if forward_norm <= 1e-9:
+            return None
+        forward /= forward_norm
+
+        world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        right = np.cross(forward, world_up)
+        right_norm = float(np.linalg.norm(right))
+        if right_norm <= 1e-9:
+            # Looking near zenith/nadir: choose a stable alternate up axis.
+            alt_up = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(np.dot(forward, alt_up))) > 0.95:
+                alt_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            right = np.cross(forward, alt_up)
+            right_norm = float(np.linalg.norm(right))
+            if right_norm <= 1e-9:
+                return None
+        right /= right_norm
+
+        up = np.cross(right, forward)
+        up_norm = float(np.linalg.norm(up))
+        if up_norm <= 1e-9:
+            return None
+        up /= up_norm
+        return forward, right, up
+
+    def _screen_from_angles(self, theta: float, phi: float) -> Optional[QPointF]:
+        """Project panorama angles into current viewport coordinates."""
+        width = max(1.0, float(self.width()))
+        height = max(1.0, float(self.height()))
+        aspect = width / height
+        fov_y = self._fov_y
+        fov_x = 2.0 * math.atan(math.tan(fov_y / 2.0) * aspect)
+
+        cos_phi = math.cos(phi)
+        direction = np.array(
+            [
+                cos_phi * math.cos(theta),
+                cos_phi * math.sin(theta),
+                math.sin(phi),
+            ],
+            dtype=np.float64,
+        )
+        basis = self._camera_basis()
+        if basis is None:
+            return None
+        forward, right, up = basis
+
+        z_forward = float(np.dot(direction, forward))
+        if z_forward <= 1e-6:
+            return None
+
+        x_cam = float(np.dot(direction, right))
+        y_cam = float(np.dot(direction, up))
+
+        if abs(self._view_roll) > 1e-9:
+            cos_r = math.cos(self._view_roll)
+            sin_r = math.sin(self._view_roll)
+            x_cam, y_cam = (
+                (x_cam * cos_r) - (y_cam * sin_r),
+                (x_cam * sin_r) + (y_cam * cos_r),
+            )
+
+        tan_half_x = math.tan(fov_x / 2.0)
+        tan_half_y = math.tan(fov_y / 2.0)
+        if tan_half_x <= 1e-9 or tan_half_y <= 1e-9:
+            return None
+
+        x_ndc = x_cam / (z_forward * tan_half_x)
+        y_ndc = y_cam / (z_forward * tan_half_y)
+        if abs(x_ndc) > 1.0 or abs(y_ndc) > 1.0:
+            return None
+
+        x_px = ((x_ndc + 1.0) * 0.5) * width
+        y_px = ((1.0 - y_ndc) * 0.5) * height
+        return QPointF(x_px, y_px)
+
+    def _draw_measurement_markers(self, painter: QPainter) -> None:
+        if not self._measurement_markers:
+            return
+
+        marker_pen = QPen(QColor(255, 221, 87))
+        marker_pen.setWidth(2)
+        text_pen = QPen(QColor(255, 245, 200))
+        for theta, phi, label in self._measurement_markers:
+            point = self._screen_from_angles(theta, phi)
+            if point is None:
+                continue
+            x = int(point.x())
+            y = int(point.y())
+            painter.setPen(marker_pen)
+            painter.drawEllipse(x - 5, y - 5, 10, 10)
+            painter.drawLine(x - 8, y, x + 8, y)
+            painter.drawLine(x, y - 8, x, y + 8)
+            painter.setPen(text_pen)
+            painter.drawText(x + 10, y - 10, label)
 
     def _upload_texture(self) -> None:
         if self._image is None:
@@ -486,5 +607,10 @@ class PanoramaWidget(QOpenGLWidget):
     def set_view_roll_degrees(self, roll_deg: float) -> None:
         """Apply a roll correction to the rendered panorama view."""
         self._view_roll = math.radians(float(roll_deg))
+        self.update()
+
+    def set_measurement_markers(self, markers: list[tuple[float, float, str]]) -> None:
+        """Set persistent markers rendered in panorama angle space."""
+        self._measurement_markers = list(markers)
         self.update()
 
