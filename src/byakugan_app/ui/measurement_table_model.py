@@ -12,6 +12,7 @@ class MeasurementTableModel(QAbstractTableModel):
     """Model backing the measurement table."""
 
     HEADERS = [
+        "Point #",
         "Pixel U",
         "Pixel V",
         "Depth (m)",
@@ -56,15 +57,16 @@ class MeasurementTableModel(QAbstractTableModel):
             return int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         mapping = {
-            0: measurement.pixel.u,
-            1: measurement.pixel.v,
-            2: f"{measurement.depth_m:.2f}",
-            3: f"{measurement.enu_vector[0]:.2f}",
-            4: f"{measurement.enu_vector[1]:.2f}",
-            5: f"{measurement.enu_vector[2]:.2f}",
-            6: f"{measurement.latitude:.7f}",
-            7: f"{measurement.longitude:.7f}",
-            8: f"{measurement.altitude:.2f}",
+            0: index.row() + 1,
+            1: measurement.pixel.u,
+            2: measurement.pixel.v,
+            3: f"{measurement.depth_m:.2f}",
+            4: f"{measurement.enu_vector[0]:.2f}",
+            5: f"{measurement.enu_vector[1]:.2f}",
+            6: f"{measurement.enu_vector[2]:.2f}",
+            7: f"{measurement.latitude:.7f}",
+            8: f"{measurement.longitude:.7f}",
+            9: f"{measurement.altitude:.2f}",
         }
         return mapping.get(index.column(), "")
 
