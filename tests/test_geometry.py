@@ -145,3 +145,16 @@ def test_triangulate_rays_closest_point_simple_intersection():
     assert math.isclose(residual, 0.0, abs_tol=1e-6)
     assert math.isclose(range_a, 1.0, abs_tol=1e-6)
     assert math.isclose(range_b, 1.0, abs_tol=1e-6)
+
+
+def test_acute_angle_between_vectors_is_sign_invariant():
+    vector_a = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    vector_b = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
+    angle_ab = geometry.acute_angle_between_vectors(vector_a, vector_b)
+    angle_a_minus_b = geometry.acute_angle_between_vectors(vector_a, -vector_b)
+    angle_parallel = geometry.acute_angle_between_vectors(vector_a, vector_a * 2.0)
+
+    assert math.isclose(angle_ab, math.pi / 2.0, abs_tol=1e-9)
+    assert math.isclose(angle_a_minus_b, math.pi / 2.0, abs_tol=1e-9)
+    assert math.isclose(angle_parallel, 0.0, abs_tol=1e-9)
