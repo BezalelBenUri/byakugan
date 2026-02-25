@@ -47,6 +47,29 @@ def spherical_direction(theta: float, phi: float) -> np.ndarray:
     )
 
 
+def acute_angle_between_vectors(
+    vector_a: np.ndarray | Tuple[float, float, float],
+    vector_b: np.ndarray | Tuple[float, float, float],
+    *,
+    epsilon: float = 1e-12,
+) -> float:
+    """Return the acute angle (radians) between two vectors.
+
+    The result is always in ``[0, pi/2]`` which is what triangulation quality
+    checks care about (parallel vs intersecting rays), independent of sign.
+    """
+    va = np.asarray(vector_a, dtype=np.float64).reshape(3)
+    vb = np.asarray(vector_b, dtype=np.float64).reshape(3)
+    na = float(np.linalg.norm(va))
+    nb = float(np.linalg.norm(vb))
+    if na <= epsilon or nb <= epsilon:
+        raise ValueError("Cannot compute angle for near-zero vector.")
+    cosine = float(np.dot(va, vb) / (na * nb))
+    cosine = float(np.clip(cosine, -1.0, 1.0))
+    angle = math.acos(cosine)
+    return min(angle, math.pi - angle)
+
+
 def enu_vector_from_angles(
     theta: float,
     phi: float,
