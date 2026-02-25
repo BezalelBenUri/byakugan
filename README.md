@@ -10,6 +10,7 @@ Byakugan is a native Python desktop application that lets Insta360 Pro2 users ex
 - Depth map ingestion (grayscale or float) plus optional stereo reconstruction using OpenCV's `StereoSGBM`.
 - Ground-plane fallback mode for panorama-only measurements when no depth map is available.
 - Two-frame triangulation mode for panorama-only depth recovery using the same feature across two capture frames.
+- Quality-gated triangulation (baseline, intersection angle, residual) with uncertainty estimates driven by frame metadata.
 - Configurable camera pose inputs (lat, lon, altitude, compass bearing) and precise ENU to ECEF conversions via `pyproj`, applied to every measurement in real time.
 - Frame pitch/roll-aware ray projection for capture-sequence measurements.
 - Measurement history with CSV/JSON export for GIS pipelines and a depth-source readout for traceability.
@@ -46,15 +47,15 @@ python -m byakugan_app
 6. Use **Reset View (Front)** to re-center on the camera bearing whenever you update the pose.
 7. For higher panorama-only accuracy, prefer **Two-Frame Triangulation** with frames that have good camera baseline and clear feature visibility.
 
-### NCTech stitched capture folders
-Byakugan can load stitched NCTech exports directly via **Load NCTech Capture Folder...**.
+### Stitched capture folders
+Byakugan can load stitched capture exports directly via **Load Capture Folder...**.
 
 - Supported layout: capture root containing `Output/` with `*.jpg` frames and a `*_framepos.txt` file.
 - Frame navigation is available inside the **Data Sources** panel (`Capture Frame` control).
 - Pose fields are auto-populated per frame from `framepos` (`lat/lon/alt/heading`).
-- Raw `*-gps.txt` and `*-imu.csv` files are discovered for future processing.
+- `*-gps.txt` records are aligned to frames to enrich per-frame GNSS/heading accuracy metadata.
 
-See `docs/NCTECH_CAPTURE_WORKFLOW.md` for detailed schema and constraints.
+See `docs/CAPTURE_WORKFLOW.md` for detailed schema and constraints.
 
 A warning banner appears while the default pose (0,0,0) is active; update the spin boxes for accurate absolute coordinates.
 
