@@ -179,7 +179,7 @@ from ..io.depth_utils import (
 
 
 from ..io.loader import StereoDepthConfig, compute_depth_from_stereo, load_depth_map, load_equirectangular_image
-from ..io.nctech_capture import NCTechStitchedCapture, discover_stitched_capture
+from ..io.capture_sequence import StitchedCapture, discover_stitched_capture
 
 
 
@@ -247,6 +247,9 @@ class MainWindow(QMainWindow):
     MEASUREMENT_MODE_DEPTH = "depth_map"
     MEASUREMENT_MODE_GROUND = "ground_plane"
     MEASUREMENT_MODE_TRIANGULATION = "triangulation_2frame"
+    MIN_TRIANGULATION_BASELINE_M = 0.50
+    MIN_TRIANGULATION_ANGLE_DEG = 1.50
+    MAX_TRIANGULATION_RESIDUAL_M = 2.50
 
 
 
@@ -297,7 +300,7 @@ class MainWindow(QMainWindow):
         self._needs_reorient = False
         self._format_combo_block = False
         self._syncing_render_view = False
-        self._active_capture: Optional[NCTechStitchedCapture] = None
+        self._active_capture: Optional[StitchedCapture] = None
         self._capture_spin_block = False
         self._capture_base_roll_offset_deg = 0.0
         self._pose_pitch_deg = 0.0
@@ -417,7 +420,6 @@ class MainWindow(QMainWindow):
 
 
 
-        layout.addWidget(self._build_viewer_controls_group())
 
 
 
@@ -508,6 +510,7 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Data Sources")
         vbox = QVBoxLayout(group)
         vbox.setSpacing(6)
+        show_advanced_controls = False
 
         self.image_path_display = QLineEdit()
         self.image_path_display.setReadOnly(True)
@@ -529,7 +532,7 @@ class MainWindow(QMainWindow):
         self.navigation_hint_label.setStyleSheet("color: #8aa; font-size: 11px;")
 
         load_image_btn = QPushButton("Load Panorama...")
-        load_capture_btn = QPushButton("Load NCTech Capture Folder...")
+        load_capture_btn = QPushButton("Load Capture Folder...")
         load_depth_btn = QPushButton("Load Depth Map...")
         generate_depth_btn = QPushButton("Generate Depth Map...")
         self.reset_view_button = QPushButton("Reset View")
@@ -549,7 +552,7 @@ class MainWindow(QMainWindow):
         self.render_view_combo.currentIndexChanged.connect(self._on_render_view_changed)
 
         load_image_btn.clicked.connect(self._on_load_panorama_clicked)
-        load_capture_btn.clicked.connect(self._on_load_nctech_capture_clicked)
+        load_capture_btn.clicked.connect(self._on_load_capture_folder_clicked)
         load_depth_btn.clicked.connect(self._on_load_depth_clicked)
         generate_depth_btn.clicked.connect(self._on_generate_depth_clicked)
 
@@ -581,29 +584,40 @@ class MainWindow(QMainWindow):
         vbox.addLayout(frame_row)
         vbox.addWidget(self.detected_frames_label)
         vbox.addWidget(self.capture_status_label)
-        vbox.addSpacing(4)
-        vbox.addWidget(load_depth_btn)
-        vbox.addWidget(self.depth_path_display)
-        vbox.addSpacing(4)
-        vbox.addWidget(generate_depth_btn)
         vbox.addWidget(self.reset_view_button)
 
-        format_row = QHBoxLayout()
-        format_row.setSpacing(6)
-        format_row.addWidget(QLabel("Image Format:"))
-        format_row.addWidget(self.format_combo, 1)
-        vbox.addLayout(format_row)
-        vbox.addWidget(self.distortion_button)
+        if show_advanced_controls:
+            vbox.addSpacing(4)
+            vbox.addWidget(load_depth_btn)
+            vbox.addWidget(self.depth_path_display)
+            vbox.addSpacing(4)
+            vbox.addWidget(generate_depth_btn)
 
-        render_row = QHBoxLayout()
-        render_row.setSpacing(6)
-        render_row.addWidget(QLabel("Render View:"))
-        render_row.addWidget(self.render_view_combo, 1)
-        vbox.addLayout(render_row)
+            format_row = QHBoxLayout()
+            format_row.setSpacing(6)
+            format_row.addWidget(QLabel("Image Format:"))
+            format_row.addWidget(self.format_combo, 1)
+            vbox.addLayout(format_row)
+            vbox.addWidget(self.distortion_button)
+
+            render_row = QHBoxLayout()
+            render_row.setSpacing(6)
+            render_row.addWidget(QLabel("Render View:"))
+            render_row.addWidget(self.render_view_combo, 1)
+            vbox.addLayout(render_row)
+        else:
+            load_depth_btn.hide()
+            generate_depth_btn.hide()
+            self.depth_path_display.hide()
+            self.format_combo.hide()
+            self.distortion_button.hide()
+            self.render_view_combo.hide()
+            self.stereo_status_label.hide()
 
         vbox.addSpacing(6)
         vbox.addWidget(self.navigation_hint_label)
-        vbox.addWidget(self.stereo_status_label)
+        if show_advanced_controls:
+            vbox.addWidget(self.stereo_status_label)
 
         self._populate_format_combo()
         self._update_reset_button_state()
@@ -896,8 +910,8 @@ class MainWindow(QMainWindow):
 
         file_menu.addAction(load_action)
 
-        load_capture_action = QAction("Load NCTech Capture Folder...", self)
-        load_capture_action.triggered.connect(self._on_load_nctech_capture_clicked)
+        load_capture_action = QAction("Load Capture Folder...", self)
+        load_capture_action.triggered.connect(self._on_load_capture_folder_clicked)
         file_menu.addAction(load_capture_action)
 
 
@@ -1107,21 +1121,21 @@ class MainWindow(QMainWindow):
 
 
 
-    def _on_load_nctech_capture_clicked(self) -> None:
+    def _on_load_capture_folder_clicked(self) -> None:
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Select NCTech Capture Folder",
+            "Select Capture Folder",
             "",
         )
         if not folder:
             return
 
         capture_path = Path(folder)
-        self.statusBar().showMessage("Scanning NCTech capture folder...")
+        self.statusBar().showMessage("Scanning capture folder...")
         task = FunctionTask(discover_stitched_capture, capture_path)
-        self._bind_task(task, self._nctech_capture_loaded)
+        self._bind_task(task, self._capture_folder_loaded)
 
-    def _nctech_capture_loaded(self, capture: NCTechStitchedCapture) -> None:
+    def _capture_folder_loaded(self, capture: StitchedCapture) -> None:
         self._active_capture = capture
         self._capture_base_roll_offset_deg = 0.0
         self._clear_measurement_history()
@@ -1138,8 +1152,11 @@ class MainWindow(QMainWindow):
         capture_label = capture.capture_id or capture.capture_root.name
         self.capture_status_label.setText(
             f"Capture sequence: {capture_label} | Frames: {capture.frame_count} | "
-            f"Resolution: {capture.frame_width}x{capture.frame_height}"
+            f"Resolution: {capture.frame_width}x{capture.frame_height}\n"
+            f"Folder: {capture.capture_root}"
         )
+        self.capture_status_label.setToolTip(str(capture.capture_root))
+        self.statusBar().showMessage(f"Capture folder validated: {capture.capture_root}", 3500)
         self._load_capture_frame(0, reset_orientation=True)
 
     def _on_capture_frame_changed(self, frame_index: int) -> None:
@@ -1193,10 +1210,16 @@ class MainWindow(QMainWindow):
         self._update_render_view_controls()
         self._update_overlay_metadata()
 
+        hacc_label = (
+            f"{frame.horizontal_accuracy_m:.2f} m"
+            if frame.horizontal_accuracy_m is not None
+            else "n/a"
+        )
         self.statusBar().showMessage(
             f"Capture frame {frame_index} loaded "
             f"(heading {frame.heading_deg:.2f} deg, pitch {frame.pitch_deg:.2f} deg, "
-            f"roll {frame.roll_deg:.2f} deg, base offset {self._capture_base_roll_offset_deg:+.1f} deg)",
+            f"roll {frame.roll_deg:.2f} deg, base offset {self._capture_base_roll_offset_deg:+.1f} deg, "
+            f"hAcc {hacc_label})",
             4000,
         )
 
@@ -2092,29 +2115,86 @@ class MainWindow(QMainWindow):
         direction_a: np.ndarray,
         origin_b: np.ndarray,
         direction_b: np.ndarray,
-    ) -> tuple[np.ndarray, float, float, float, int]:
+    ) -> tuple[np.ndarray, float, float, float, int, float]:
         """Triangulate while tolerating 180-degree ray-direction ambiguity."""
-        candidates: list[tuple[int, float, np.ndarray, float, float]] = []
+        candidates: list[tuple[int, float, float, np.ndarray, float, float]] = []
         for sign_a in (1.0, -1.0):
             for sign_b in (1.0, -1.0):
+                direction_a_variant = direction_a * sign_a
+                direction_b_variant = direction_b * sign_b
                 try:
                     point, residual_m, range_a_m, range_b_m = geometry.triangulate_rays_closest_point(
                         origin_a=origin_a,
-                        direction_a=direction_a * sign_a,
+                        direction_a=direction_a_variant,
                         origin_b=origin_b,
-                        direction_b=direction_b * sign_b,
+                        direction_b=direction_b_variant,
                     )
                 except ValueError:
                     continue
+                angle_rad = geometry.acute_angle_between_vectors(direction_a_variant, direction_b_variant)
                 positive_count = int(range_a_m > 0.0) + int(range_b_m > 0.0)
-                candidates.append((positive_count, residual_m, point, range_a_m, range_b_m))
+                candidates.append((positive_count, angle_rad, residual_m, point, range_a_m, range_b_m))
 
         if not candidates:
             raise ValueError("Triangulation failed for all ray-direction variants.")
 
-        candidates.sort(key=lambda item: (-item[0], item[1]))
-        positive_count, residual_m, point, range_a_m, range_b_m = candidates[0]
-        return point, residual_m, range_a_m, range_b_m, positive_count
+        # Prefer forward intersections first, then stronger triangulation geometry,
+        # and finally tighter ray-to-ray residual.
+        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
+        positive_count, angle_rad, residual_m, point, range_a_m, range_b_m = candidates[0]
+        return point, residual_m, range_a_m, range_b_m, positive_count, angle_rad
+
+    def _estimate_triangulation_uncertainty_m(
+        self,
+        *,
+        baseline_m: float,
+        angle_rad: float,
+        range_anchor_m: float,
+        range_current_m: float,
+        image_width: int,
+        image_height: int,
+        anchor_heading_acc_deg: Optional[float],
+        current_heading_acc_deg: Optional[float],
+        anchor_hacc_m: Optional[float],
+        current_hacc_m: Optional[float],
+    ) -> float:
+        """Approximate 1-sigma position uncertainty for two-frame triangulation.
+
+        This combines three dominant terms:
+        1) pixel click quantization on the panorama ray,
+        2) heading uncertainty from GNSS/INS metadata (if available),
+        3) camera position uncertainty from GNSS horizontal accuracy.
+        """
+        if baseline_m <= 1e-9 or angle_rad <= 1e-9:
+            return float("inf")
+
+        pixel_sigma_theta = 0.5 * (2.0 * math.pi / max(1, image_width))
+        pixel_sigma_phi = 0.5 * (math.pi / max(1, image_height))
+        pixel_sigma_rad = math.hypot(pixel_sigma_theta, pixel_sigma_phi)
+
+        heading_sigmas = [
+            math.radians(value)
+            for value in (anchor_heading_acc_deg, current_heading_acc_deg)
+            if value is not None and value > 0.0
+        ]
+        heading_sigma_rad = max(heading_sigmas) if heading_sigmas else 0.0
+        angular_sigma_rad = math.hypot(pixel_sigma_rad, heading_sigma_rad)
+
+        representative_range = max(0.0, 0.5 * (range_anchor_m + range_current_m))
+        geometry_gain = 1.0 / max(math.sin(angle_rad), 1e-6)
+        angular_component_m = representative_range * angular_sigma_rad * geometry_gain
+
+        horizontal_sigmas = [
+            value
+            for value in (anchor_hacc_m, current_hacc_m)
+            if value is not None and value > 0.0
+        ]
+        if horizontal_sigmas:
+            pose_component_m = float(np.sqrt(np.mean(np.square(horizontal_sigmas))))
+        else:
+            pose_component_m = 0.0
+
+        return float(math.hypot(angular_component_m, pose_component_m))
 
     def _refresh_viewer_image(self, reset_orientation: bool = True) -> None:
 
@@ -2639,7 +2719,7 @@ class MainWindow(QMainWindow):
         )
 
         baseline_m = float(np.linalg.norm(baseline))
-        if baseline_m < 0.25:
+        if baseline_m < self.MIN_TRIANGULATION_BASELINE_M:
             self.statusBar().showMessage(
                 "Triangulation baseline too small. Move to a farther frame for accurate coordinates.",
                 4000,
@@ -2653,6 +2733,7 @@ class MainWindow(QMainWindow):
                 range_anchor_m,
                 range_current_m,
                 positive_count,
+                intersection_angle_rad,
             ) = self._triangulate_with_direction_variants(
                 origin_a=np.zeros(3, dtype=np.float64),
                 direction_a=direction_a,
@@ -2661,6 +2742,24 @@ class MainWindow(QMainWindow):
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Two-Frame Triangulation", str(exc))
+            return
+
+        intersection_angle_deg = math.degrees(intersection_angle_rad)
+        if intersection_angle_deg < self.MIN_TRIANGULATION_ANGLE_DEG:
+            self.statusBar().showMessage(
+                "Triangulation angle is too small for high-accuracy output. "
+                "Choose a farther frame with more parallax.",
+                4500,
+            )
+            return
+
+        residual_limit_m = max(self.MAX_TRIANGULATION_RESIDUAL_M, baseline_m * 0.35)
+        if residual_m > residual_limit_m:
+            self.statusBar().showMessage(
+                "Triangulation residual is too high for accurate output. "
+                "Re-click using a clearer feature and a wider baseline.",
+                5000,
+            )
             return
 
         if positive_count < 2:
@@ -2693,6 +2792,21 @@ class MainWindow(QMainWindow):
                     "Triangulation is unstable for this point. Try a farther frame or click a stronger feature.",
                 )
                 return
+
+        anchor_frame = self._active_capture.frames[anchor.frame_index]
+        current_frame = self._active_capture.frames[frame_index]
+        uncertainty_m = self._estimate_triangulation_uncertainty_m(
+            baseline_m=baseline_m,
+            angle_rad=intersection_angle_rad,
+            range_anchor_m=range_anchor_m,
+            range_current_m=range_current_m,
+            image_width=width,
+            image_height=height,
+            anchor_heading_acc_deg=anchor_frame.heading_accuracy_deg,
+            current_heading_acc_deg=current_frame.heading_accuracy_deg,
+            anchor_hacc_m=anchor_frame.horizontal_accuracy_m,
+            current_hacc_m=current_frame.horizontal_accuracy_m,
+        )
 
         lat, lon, alt = geodesy.enu_to_geodetic(
             point_anchor_enu[0],
@@ -2729,7 +2843,7 @@ class MainWindow(QMainWindow):
         self._update_selection_labels(measurement, local_vec)
         self.depth_source_label.setText(
             "Two-frame triangulation "
-            f"(residual {residual_m:.2f} m, baseline {baseline_m:.2f} m)"
+            f"(angle {intersection_angle_deg:.2f} deg, residual {residual_m:.2f} m, est. sigma {uncertainty_m:.2f} m)"
         )
         if hasattr(self, "triangulation_label"):
             self.triangulation_label.setText(
@@ -2738,10 +2852,10 @@ class MainWindow(QMainWindow):
 
         message = (
             f"Triangulated point from frames {anchor.frame_index} -> {frame_index} "
-            f"(residual {residual_m:.2f} m)"
+            f"(angle {intersection_angle_deg:.2f} deg, residual {residual_m:.2f} m, sigma~{uncertainty_m:.2f} m)"
         )
-        if residual_m > 2.0:
-            message += " [high residual]"
+        if uncertainty_m > 3.0:
+            message += " [high uncertainty]"
         if self.pose_warning_label.isVisible():
             message += " (default camera pose - update lat/lon/alt for accuracy)"
         self.statusBar().showMessage(message, 5000)
