@@ -63,7 +63,17 @@ Write-Host "[split-commit] Scope:   $scopePath"
 Write-Host "[split-commit] Message: $Message"
 
 $files = Collect-ScopedFiles -ScopePath $scopePath
-if ($files.Count -eq 0) { Write-Host "[split-commit] No Backend changes to commit."; exit 0 }
+if ($files.Count -eq 0) {
+  Write-Host "[split-commit] No Backend changes to commit."
+  if (-not $NoPush) {
+    Write-Host "[split-commit] No new file commits; attempting push for existing local commits."
+    Write-Host "[split-commit] Pushing to origin/$branch"
+    git push -u origin "$branch"
+  } else {
+    Write-Host "[split-commit] Skipping push (-NoPush)"
+  }
+  exit 0
+}
 
 Write-Host "[split-commit] Files: $($files.Count)"; foreach ($f in $files) { Write-Host " - $f" }
 
