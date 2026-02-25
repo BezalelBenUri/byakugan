@@ -6,7 +6,7 @@ Byakugan is organised into focused packages so that math, rendering, IO, and UI 
 
 1. **Bootstrap**: `byakugan_app.main` configures logging, high-DPI, theme, and instantiates `MainWindow`.
 2. **State**: `PanoramaState` tracks the loaded panorama (raw + viewer image), depth map, camera pose metadata, and stereo detection metadata.
-   - For NCTech stitched captures, `io.nctech_capture.discover_stitched_capture` provides frame-indexed panorama paths and pose records from `*_framepos.txt`.
+   - For stitched captures, `io.capture_sequence.discover_stitched_capture` provides frame-indexed panorama paths and pose records from `*_framepos.txt`.
 3. **Stereo Detection**: `io.depth_utils.detect_stereo_format` inspects panorama dimensions to classify mono versus top-bottom/side-by-side stereo; the raw image is split automatically when stereo is present.
 4. **Rendering**: `PanoramaWidget` (PyQt6 + PyOpenGL) renders the equirectangular panorama mapped to the inside of a textured sphere, aligns the initial view with the camera bearing, and exposes full yaw/pitch navigation (mouse drag, wheel zoom, keyboard shortcuts).
 5. **Computation**: `math.geometry` turns pixels into spherical angles and ENU vectors (bearing + pitch + roll aware); `math.geodesy` converts ENU to geodetic coordinates with `pyproj`. Camera pose values (lat, lon, altitude, bearing) are applied immediately to every measurement. Measurements can use (a) depth-map sampling, (b) ground-plane intersection (`camera altitude - camera height`), or (c) two-frame triangulation.
@@ -19,7 +19,7 @@ Byakugan is organised into focused packages so that math, rendering, IO, and UI 
 | Module | Responsibility |
 | ------ | -------------- |
 | `byakugan_app/io/depth_utils.py` | Stereo format detection, panorama splitting, and depth computation via SGBM |
-| `byakugan_app/io/nctech_capture.py` | Strict parsing/validation of stitched NCTech capture folders and frame pose metadata |
+| `byakugan_app/io/capture_sequence.py` | Strict parsing/validation of stitched capture folders and frame pose metadata |
 | `byakugan_app/viewer/panorama_widget.py` | OpenGL sphere rendering, camera navigation, and picking signals |
 | `byakugan_app/ui/main_window.py` | UI composition, signal wiring, data validation, depth/ground-plane measurement modes, and exports |
 | `byakugan_app/ui/depth_generation_dialog.py` | Configurable dialog for generating depth from panoramas or external stereo pairs |
