@@ -1107,6 +1107,35 @@ class MainWindow(QMainWindow):
             field.blockSignals(False)
         self._update_camera_pose()
 
+    def _resolve_frame_bearing_deg(self, frame) -> float:
+        """Resolve per-frame bearing with robustness to noisy heading metadata.
+
+        If heading accuracy is weak, course/track is usually the more stable
+        estimate. When heading accuracy is available, blend heading+track on
+        the unit circle to avoid wrap-around artifacts near 0/360 degrees.
+        """
+        heading_deg = float(frame.heading_deg) % 360.0
+        track_deg = float(frame.track_deg) % 360.0
+
+        heading_acc = frame.heading_accuracy_deg
+        if heading_acc is None or heading_acc <= 0.0:
+            return heading_deg
+        if heading_acc >= 4.0:
+            return track_deg
+
+        # Inverse-variance weighting on circular components.
+        heading_sigma = max(0.25, float(heading_acc))
+        track_sigma = 2.0
+        w_heading = 1.0 / (heading_sigma * heading_sigma)
+        w_track = 1.0 / (track_sigma * track_sigma)
+        heading_rad = math.radians(heading_deg)
+        track_rad = math.radians(track_deg)
+        x = (w_heading * math.cos(heading_rad)) + (w_track * math.cos(track_rad))
+        y = (w_heading * math.sin(heading_rad)) + (w_track * math.sin(track_rad))
+        if abs(x) <= 1e-9 and abs(y) <= 1e-9:
+            return heading_deg
+        return math.degrees(math.atan2(y, x)) % 360.0
+
     def _apply_view_roll(self) -> None:
         """Apply pose-derived roll and manual operator offset to the viewer."""
         total_roll = self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
@@ -1182,6 +1211,14 @@ class MainWindow(QMainWindow):
         capture = self._active_capture
         if capture is None or frame_index < 0 or frame_index >= capture.frame_count:
             return
+        current_frame_index = self._current_capture_frame_index()
+        if current_frame_index is not None and frame_index != current_frame_index:
+            logger.debug(
+                "Ignoring stale frame load: loaded={}, current={}",
+                frame_index,
+                current_frame_index,
+            )
+            return
 
         frame = capture.frames[frame_index]
         self._pose_pitch_deg = float(frame.pitch_deg)
@@ -1190,11 +1227,12 @@ class MainWindow(QMainWindow):
         self._state.set_image(image, frame.image_path)
         self._refresh_viewer_image(reset_orientation=reset_orientation)
         self.viewer.set_instruction_visible(frame_index == 0)
+        resolved_bearing_deg = self._resolve_frame_bearing_deg(frame)
         self._set_camera_pose_fields(
             latitude=frame.latitude,
             longitude=frame.longitude,
             altitude=frame.altitude_m,
-            bearing=frame.heading_deg,
+            bearing=resolved_bearing_deg,
         )
 
         self.image_path_display.setText(str(frame.image_path))
@@ -1217,7 +1255,7 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(
             f"Capture frame {frame_index} loaded "
-            f"(heading {frame.heading_deg:.2f} deg, pitch {frame.pitch_deg:.2f} deg, "
+            f"(heading {resolved_bearing_deg:.2f} deg, pitch {frame.pitch_deg:.2f} deg, "
             f"roll {frame.roll_deg:.2f} deg, base offset {self._capture_base_roll_offset_deg:+.1f} deg, "
             f"hAcc {hacc_label})",
             4000,
@@ -2028,11 +2066,15 @@ class MainWindow(QMainWindow):
             return
         current_frame_index = self._current_capture_frame_index() if self._active_capture is not None else None
         markers: list[tuple[float, float, str]] = []
-        for theta_phi, frame_index in zip(self._measurement_marker_angles, self._measurement_marker_frames):
+        for point_index, (theta_phi, frame_index) in enumerate(
+            zip(self._measurement_marker_angles, self._measurement_marker_frames),
+            start=1,
+        ):
             if frame_index is not None and frame_index != current_frame_index:
                 continue
             theta, phi = theta_phi
-            markers.append((theta, phi, f"pt{len(markers) + 1}"))
+            # Keep global point numbering stable across frame filters.
+            markers.append((theta, phi, f"pt{point_index}"))
         self.viewer.set_measurement_markers(markers)
 
     def _copy_selected_measurement_cells(self) -> None:
