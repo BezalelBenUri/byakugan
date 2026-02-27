@@ -158,3 +158,34 @@ def test_acute_angle_between_vectors_is_sign_invariant():
     assert math.isclose(angle_ab, math.pi / 2.0, abs_tol=1e-9)
     assert math.isclose(angle_a_minus_b, math.pi / 2.0, abs_tol=1e-9)
     assert math.isclose(angle_parallel, 0.0, abs_tol=1e-9)
+
+
+def test_triangulate_rays_weighted_least_squares_downweights_outlier_ray():
+    true_point = np.array([8.0, 2.0, 1.0], dtype=np.float64)
+    origins = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [0.0, 2.0, 5.0],
+        ],
+        dtype=np.float64,
+    )
+    directions = true_point[None, :] - origins
+    directions[2] += np.array([1.5, -1.0, 0.5], dtype=np.float64)  # outlier click/ray
+
+    unweighted_point, _, _ = geometry.triangulate_rays_weighted_least_squares(origins, directions)
+    weighted_point, _, ranges = geometry.triangulate_rays_weighted_least_squares(
+        origins,
+        directions,
+        weights=np.array([1.0, 1.0, 0.05], dtype=np.float64),
+    )
+
+    assert np.linalg.norm(weighted_point - true_point) < np.linalg.norm(unweighted_point - true_point)
+    assert np.all(ranges > 0.0)
+
+
+def test_geodesic_inverse_matches_expected_eastward_distance():
+    azimuth, _, distance = geodesy.geodesic_inverse(0.0, 0.0, 0.0, 0.001)
+    assert math.isclose(azimuth, 90.0, abs_tol=1e-4)
+    assert math.isclose(distance, geodesy.geodesic_distance_m(0.0, 0.0, 0.0, 0.001), abs_tol=1e-9)
+    assert math.isclose(distance, 111.319, rel_tol=1e-3)
