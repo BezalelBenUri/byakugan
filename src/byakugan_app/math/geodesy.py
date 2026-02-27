@@ -6,10 +6,11 @@ import math
 from typing import Tuple
 
 import numpy as np
-from pyproj import CRS, Transformer
+from pyproj import CRS, Geod, Transformer
 
 WGS84_GEODETIC = CRS.from_epsg(4979)  # lon, lat, h
 WGS84_ECEF = CRS.from_epsg(4978)
+WGS84_GEOD = Geod(ellps="WGS84")
 
 
 @functools.lru_cache(maxsize=2)
@@ -27,6 +28,47 @@ def geodetic_to_ecef(lon_deg: float, lat_deg: float, alt_m: float) -> Tuple[floa
     transformer = _geodetic_to_ecef_transformer()
     x, y, z = transformer.transform(lon_deg, lat_deg, alt_m)
     return x, y, z
+
+
+def geodesic_inverse(
+    lat_a_deg: float,
+    lon_a_deg: float,
+    lat_b_deg: float,
+    lon_b_deg: float,
+) -> Tuple[float, float, float]:
+    """Return forward azimuth, back azimuth, and distance on WGS84.
+
+    Azimuths are returned in degrees in ``[0, 360)`` and distance in metres.
+    """
+    forward_deg, back_deg, distance_m = WGS84_GEOD.inv(
+        lon_a_deg,
+        lat_a_deg,
+        lon_b_deg,
+        lat_b_deg,
+    )
+    return (forward_deg % 360.0), (back_deg % 360.0), float(distance_m)
+
+
+def forward_azimuth_deg(
+    lat_a_deg: float,
+    lon_a_deg: float,
+    lat_b_deg: float,
+    lon_b_deg: float,
+) -> float:
+    """Return WGS84 forward azimuth from point A to B in degrees."""
+    azimuth_deg, _, _ = geodesic_inverse(lat_a_deg, lon_a_deg, lat_b_deg, lon_b_deg)
+    return azimuth_deg
+
+
+def geodesic_distance_m(
+    lat_a_deg: float,
+    lon_a_deg: float,
+    lat_b_deg: float,
+    lon_b_deg: float,
+) -> float:
+    """Return WGS84 geodesic distance between two geodetic points."""
+    _, _, distance_m = geodesic_inverse(lat_a_deg, lon_a_deg, lat_b_deg, lon_b_deg)
+    return distance_m
 
 
 def ecef_to_geodetic(x: float, y: float, z: float) -> Tuple[float, float, float]:
