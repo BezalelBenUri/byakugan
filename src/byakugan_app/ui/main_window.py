@@ -250,6 +250,10 @@ class MainWindow(QMainWindow):
     MIN_TRIANGULATION_BASELINE_M = 0.50
     MIN_TRIANGULATION_ANGLE_DEG = 1.50
     MAX_TRIANGULATION_RESIDUAL_M = 2.50
+    CAPTURE_HORIZONTAL_FLIP = True
+    MIN_BEARING_CALIBRATION_BASELINE_M = 1.0
+    MIN_BEARING_CALIBRATION_SAMPLES = 24
+    MIN_BEARING_CALIBRATION_CONCENTRATION = 0.60
 
 
 
@@ -311,6 +315,9 @@ class MainWindow(QMainWindow):
         self._measurement_history: list[PointMeasurement] = []
         self._measurement_marker_angles: list[tuple[float, float]] = []
         self._measurement_marker_frames: list[Optional[int]] = []
+        self._capture_horizontal_flip_enabled = self.CAPTURE_HORIZONTAL_FLIP
+        self._capture_bearing_offset_deg = 0.0
+        self._capture_resolved_bearings_deg: list[float] = []
 
         self._build_ui()
 
@@ -412,30 +419,38 @@ class MainWindow(QMainWindow):
 
 
 
-        layout.addWidget(self._build_camera_group())
+        camera_group = self._build_camera_group()
+        data_group = self._build_data_group()
+        self.selection_group = self._build_selection_group()
+        measurements_group = self._build_measurements_group()
+
+        self.selection_toggle_btn = QPushButton("Show Selection Readout")
+        self.selection_toggle_btn.setCheckable(True)
+        self.selection_toggle_btn.setChecked(False)
+        self.selection_toggle_btn.clicked.connect(self._toggle_selection_readout)
+        self.selection_group.setVisible(False)
+
+        layout.addWidget(camera_group)
 
 
 
-        layout.addWidget(self._build_data_group())
+        layout.addWidget(data_group)
 
 
 
 
 
 
-        layout.addWidget(self._build_selection_group())
+        layout.addWidget(self.selection_toggle_btn)
+        layout.addWidget(self.selection_group)
 
 
 
-        layout.addWidget(self._build_measurements_group(), stretch=1)
-
-
-
+        layout.addWidget(measurements_group, stretch=1)
 
 
 
 
-        layout.addStretch(1)
 
 
 
@@ -755,6 +770,15 @@ class MainWindow(QMainWindow):
         self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
         return group
 
+    def _toggle_selection_readout(self, checked: bool) -> None:
+        """Show/hide the selection readout to preserve space on smaller screens."""
+        if not hasattr(self, "selection_group") or not hasattr(self, "selection_toggle_btn"):
+            return
+        self.selection_group.setVisible(bool(checked))
+        self.selection_toggle_btn.setText(
+            "Hide Selection Readout" if checked else "Show Selection Readout"
+        )
+
 
 
     # Measurements -----------------------------------------------------------
@@ -777,6 +801,7 @@ class MainWindow(QMainWindow):
         self.measurement_count_label.setStyleSheet("color: #8aa; font-size: 11px;")
 
         self.measurement_table = QTableView()
+        self.measurement_table.setMinimumHeight(220)
 
 
 
@@ -1107,8 +1132,13 @@ class MainWindow(QMainWindow):
             field.blockSignals(False)
         self._update_camera_pose()
 
-    def _resolve_frame_bearing_deg(self, frame) -> float:
-        """Resolve per-frame bearing with robustness to noisy heading metadata.
+    @staticmethod
+    def _wrap_signed_angle_deg(value_deg: float) -> float:
+        """Wrap an angle difference into [-180, 180) degrees."""
+        return ((float(value_deg) + 180.0) % 360.0) - 180.0
+
+    def _resolve_raw_frame_bearing_deg(self, frame) -> float:
+        """Resolve per-frame bearing from export metadata only.
 
         If heading accuracy is weak, course/track is usually the more stable
         estimate. When heading accuracy is available, blend heading+track on
@@ -1136,10 +1166,97 @@ class MainWindow(QMainWindow):
             return heading_deg
         return math.degrees(math.atan2(y, x)) % 360.0
 
+    def _resolve_frame_bearing_deg(self, frame, frame_index: Optional[int] = None) -> float:
+        """Resolve final frame bearing (raw blend + capture-level calibration)."""
+        if frame_index is not None and 0 <= frame_index < len(self._capture_resolved_bearings_deg):
+            return float(self._capture_resolved_bearings_deg[frame_index]) % 360.0
+        return (self._resolve_raw_frame_bearing_deg(frame) + self._capture_bearing_offset_deg) % 360.0
+
+    def _build_capture_bearing_solution(self, capture: StitchedCapture) -> list[float]:
+        """Build per-frame bearings after trajectory-based boresight calibration."""
+        if capture.frame_count <= 0:
+            self._capture_bearing_offset_deg = 0.0
+            return []
+
+        raw_bearings = [self._resolve_raw_frame_bearing_deg(frame) for frame in capture.frames]
+        offset_deg = self._estimate_capture_bearing_offset_deg(capture, raw_bearings)
+        self._capture_bearing_offset_deg = offset_deg
+        return [((bearing + offset_deg) % 360.0) for bearing in raw_bearings]
+
+    def _estimate_capture_bearing_offset_deg(
+        self,
+        capture: StitchedCapture,
+        raw_bearings_deg: list[float],
+    ) -> float:
+        """Estimate constant yaw boresight offset from trajectory course.
+
+        The estimator compares each frame's orientation to the WGS84 forward
+        azimuth between consecutive frame positions, then computes a weighted
+        circular mean of the offsets.
+        """
+        if capture.frame_count < 2 or len(raw_bearings_deg) != capture.frame_count:
+            return 0.0
+
+        offsets_rad: list[float] = []
+        weights: list[float] = []
+
+        for idx in range(capture.frame_count - 1):
+            frame_a = capture.frames[idx]
+            frame_b = capture.frames[idx + 1]
+            course_deg, _, distance_m = geodesy.geodesic_inverse(
+                frame_a.latitude,
+                frame_a.longitude,
+                frame_b.latitude,
+                frame_b.longitude,
+            )
+            if distance_m < self.MIN_BEARING_CALIBRATION_BASELINE_M:
+                continue
+
+            delta_deg = self._wrap_signed_angle_deg(course_deg - raw_bearings_deg[idx])
+
+            heading_sigma_deg = frame_a.heading_accuracy_deg if frame_a.heading_accuracy_deg is not None else 3.0
+            heading_sigma_deg = float(np.clip(heading_sigma_deg, 0.5, 45.0))
+            # Convert GNSS horizontal uncertainty into an angular component.
+            hacc_m = frame_a.horizontal_accuracy_m if frame_a.horizontal_accuracy_m is not None else 2.0
+            hacc_m = float(np.clip(hacc_m, 0.3, 50.0))
+            pose_sigma_deg = math.degrees(math.atan2(hacc_m, max(distance_m, 1e-3)))
+            sigma_deg = max(0.5, math.hypot(heading_sigma_deg, pose_sigma_deg))
+            weight = min(2.0, distance_m / 5.0) / (sigma_deg * sigma_deg)
+            if weight <= 0.0:
+                continue
+
+            offsets_rad.append(math.radians(delta_deg))
+            weights.append(weight)
+
+        if len(offsets_rad) < self.MIN_BEARING_CALIBRATION_SAMPLES:
+            return 0.0
+        total_weight = float(np.sum(weights))
+        if total_weight <= 1e-9:
+            return 0.0
+
+        x = float(np.sum(np.asarray(weights) * np.cos(np.asarray(offsets_rad))))
+        y = float(np.sum(np.asarray(weights) * np.sin(np.asarray(offsets_rad))))
+        concentration = math.hypot(x, y) / total_weight
+        if concentration < self.MIN_BEARING_CALIBRATION_CONCENTRATION:
+            return 0.0
+
+        return math.degrees(math.atan2(y, x))
+
     def _apply_view_roll(self) -> None:
         """Apply pose-derived roll and manual operator offset to the viewer."""
         total_roll = self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
         self.viewer.set_view_roll_degrees(total_roll)
+
+    def _prepare_capture_frame_image(self, image: np.ndarray) -> np.ndarray:
+        """Normalize stitched capture frame orientation before rendering/math.
+
+        Some stitched capture exports encode panoramas with horizontal mirroring.
+        Flipping once here aligns text/readouts and keeps pixel->ray geometry
+        consistent with real-world left/right directions.
+        """
+        if not self._capture_horizontal_flip_enabled:
+            return image
+        return np.ascontiguousarray(np.flip(image, axis=1))
 
 
     # ------------------------------------------------------------------
@@ -1167,6 +1284,7 @@ class MainWindow(QMainWindow):
     def _capture_folder_loaded(self, capture: StitchedCapture) -> None:
         self._active_capture = capture
         self._capture_base_roll_offset_deg = 0.0
+        self._capture_resolved_bearings_deg = self._build_capture_bearing_solution(capture)
         self._clear_measurement_history()
         self._clear_triangulation_anchor(update_label=True)
         self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
@@ -1185,7 +1303,11 @@ class MainWindow(QMainWindow):
             f"Folder: {capture.capture_root}"
         )
         self.capture_status_label.setToolTip(str(capture.capture_root))
-        self.statusBar().showMessage(f"Capture folder validated: {capture.capture_root}", 3500)
+        self.statusBar().showMessage(
+            f"Capture folder validated: {capture.capture_root} "
+            f"(bearing calibration {self._capture_bearing_offset_deg:+.2f} deg)",
+            4000,
+        )
         self._load_capture_frame(0, reset_orientation=True)
 
     def _on_capture_frame_changed(self, frame_index: int) -> None:
@@ -1221,13 +1343,14 @@ class MainWindow(QMainWindow):
             return
 
         frame = capture.frames[frame_index]
+        image = self._prepare_capture_frame_image(image)
         self._pose_pitch_deg = float(frame.pitch_deg)
         self._pose_roll_deg = float(frame.roll_deg)
         self._apply_view_roll()
         self._state.set_image(image, frame.image_path)
         self._refresh_viewer_image(reset_orientation=reset_orientation)
         self.viewer.set_instruction_visible(frame_index == 0)
-        resolved_bearing_deg = self._resolve_frame_bearing_deg(frame)
+        resolved_bearing_deg = self._resolve_frame_bearing_deg(frame, frame_index)
         self._set_camera_pose_fields(
             latitude=frame.latitude,
             longitude=frame.longitude,
@@ -1257,13 +1380,16 @@ class MainWindow(QMainWindow):
             f"Capture frame {frame_index} loaded "
             f"(heading {resolved_bearing_deg:.2f} deg, pitch {frame.pitch_deg:.2f} deg, "
             f"roll {frame.roll_deg:.2f} deg, base offset {self._capture_base_roll_offset_deg:+.1f} deg, "
-            f"hAcc {hacc_label})",
+            f"hAcc {hacc_label}, bearing calib {self._capture_bearing_offset_deg:+.2f} deg, "
+            f"mirror {'on' if self._capture_horizontal_flip_enabled else 'off'})",
             4000,
         )
 
     def _clear_active_capture(self) -> None:
         self._active_capture = None
         self._capture_base_roll_offset_deg = 0.0
+        self._capture_bearing_offset_deg = 0.0
+        self._capture_resolved_bearings_deg = []
         self._pose_pitch_deg = 0.0
         self._pose_roll_deg = 0.0
         self._apply_view_roll()
@@ -2057,6 +2183,23 @@ class MainWindow(QMainWindow):
         self._update_measurement_count_label()
         self._sync_viewer_measurement_markers()
 
+    def _rebuild_measurement_table(self) -> None:
+        """Rebuild the table model from persisted measurement history.
+
+        This guarantees deterministic multi-point rendering even after view/layout
+        changes or repeated frame navigation.
+        """
+        self.measurement_model = MeasurementTableModel(self)
+        if hasattr(self, "measurement_table"):
+            self.measurement_table.setModel(self.measurement_model)
+        for measurement in self._measurement_history:
+            self.measurement_model.add_measurement(measurement)
+        self._update_measurement_count_label()
+        self._sync_viewer_measurement_markers()
+        if hasattr(self, "measurement_table"):
+            self.measurement_table.resizeColumnsToContents()
+            self.measurement_table.scrollToBottom()
+
     def _update_measurement_count_label(self) -> None:
         if hasattr(self, "measurement_count_label"):
             self.measurement_count_label.setText(f"Saved Points: {len(self._measurement_history)}")
@@ -2157,22 +2300,35 @@ class MainWindow(QMainWindow):
         direction_a: np.ndarray,
         origin_b: np.ndarray,
         direction_b: np.ndarray,
+        *,
+        weight_a: float = 1.0,
+        weight_b: float = 1.0,
     ) -> tuple[np.ndarray, float, float, float, int, float]:
-        """Triangulate while tolerating 180-degree ray-direction ambiguity."""
+        """Triangulate while tolerating 180-degree ray-direction ambiguity.
+
+        A weighted least-squares line intersection is used so frames with
+        stronger GNSS confidence can contribute more than noisier frames.
+        """
         candidates: list[tuple[int, float, float, np.ndarray, float, float]] = []
+        origins = np.stack([origin_a, origin_b], axis=0)
+        weights = np.array([max(weight_a, 1e-6), max(weight_b, 1e-6)], dtype=np.float64)
         for sign_a in (1.0, -1.0):
             for sign_b in (1.0, -1.0):
                 direction_a_variant = direction_a * sign_a
                 direction_b_variant = direction_b * sign_b
                 try:
-                    point, residual_m, range_a_m, range_b_m = geometry.triangulate_rays_closest_point(
-                        origin_a=origin_a,
-                        direction_a=direction_a_variant,
-                        origin_b=origin_b,
-                        direction_b=direction_b_variant,
+                    point, residual_rms_m, ranges = geometry.triangulate_rays_weighted_least_squares(
+                        origins=origins,
+                        directions=np.stack([direction_a_variant, direction_b_variant], axis=0),
+                        weights=weights,
                     )
                 except ValueError:
                     continue
+                range_a_m = float(ranges[0])
+                range_b_m = float(ranges[1])
+                # Keep residual semantics close to the previous two-ray
+                # closest-point metric by scaling RMS line distance.
+                residual_m = float(residual_rms_m * 2.0)
                 angle_rad = geometry.acute_angle_between_vectors(direction_a_variant, direction_b_variant)
                 positive_count = int(range_a_m > 0.0) + int(range_b_m > 0.0)
                 candidates.append((positive_count, angle_rad, residual_m, point, range_a_m, range_b_m))
@@ -2185,6 +2341,20 @@ class MainWindow(QMainWindow):
         candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
         positive_count, angle_rad, residual_m, point, range_a_m, range_b_m = candidates[0]
         return point, residual_m, range_a_m, range_b_m, positive_count, angle_rad
+
+    def _triangulation_pose_weight(
+        self,
+        *,
+        horizontal_accuracy_m: Optional[float],
+        heading_accuracy_deg: Optional[float],
+    ) -> float:
+        """Return inverse-variance style confidence weight for one frame pose."""
+        hacc = float(horizontal_accuracy_m) if horizontal_accuracy_m is not None else 2.0
+        hacc = float(np.clip(hacc, 0.3, 50.0))
+        heading_acc = float(heading_accuracy_deg) if heading_accuracy_deg is not None else 3.0
+        heading_acc = float(np.clip(heading_acc, 0.5, 45.0))
+        sigma_equiv = math.hypot(hacc, heading_acc * 0.1)
+        return 1.0 / max(sigma_equiv * sigma_equiv, 1e-6)
 
     def _estimate_triangulation_uncertainty_m(
         self,
@@ -2727,17 +2897,19 @@ class MainWindow(QMainWindow):
         anchor = self._triangulation_anchor
         assert anchor is not None  # for type checkers
 
-        baseline_e, baseline_n, baseline_u = geodesy.geodetic_to_enu(
-            pose_copy.latitude,
-            pose_copy.longitude,
-            pose_copy.altitude,
-            anchor.pose.latitude,
-            anchor.pose.longitude,
-            anchor.pose.altitude,
-        )
-        baseline = np.array([baseline_e, baseline_n, baseline_u], dtype=np.float64)
+        anchor_frame = self._active_capture.frames[anchor.frame_index]
+        current_frame = self._active_capture.frames[frame_index]
 
-        direction_a = np.array(
+        origin_anchor_ecef = np.array(
+            geodesy.geodetic_to_ecef(anchor.pose.longitude, anchor.pose.latitude, anchor.pose.altitude),
+            dtype=np.float64,
+        )
+        origin_current_ecef = np.array(
+            geodesy.geodetic_to_ecef(pose_copy.longitude, pose_copy.latitude, pose_copy.altitude),
+            dtype=np.float64,
+        )
+
+        direction_anchor_enu = np.array(
             geometry.enu_vector_from_angles(
                 anchor.theta,
                 anchor.phi,
@@ -2748,7 +2920,7 @@ class MainWindow(QMainWindow):
             ),
             dtype=np.float64,
         )
-        direction_b = np.array(
+        direction_current_enu = np.array(
             geometry.enu_vector_from_angles(
                 theta,
                 phi,
@@ -2759,8 +2931,28 @@ class MainWindow(QMainWindow):
             ),
             dtype=np.float64,
         )
+        direction_anchor_ecef = np.array(
+            geodesy.enu_to_ecef(
+                float(direction_anchor_enu[0]),
+                float(direction_anchor_enu[1]),
+                float(direction_anchor_enu[2]),
+                anchor.pose.latitude,
+                anchor.pose.longitude,
+            ),
+            dtype=np.float64,
+        )
+        direction_current_ecef = np.array(
+            geodesy.enu_to_ecef(
+                float(direction_current_enu[0]),
+                float(direction_current_enu[1]),
+                float(direction_current_enu[2]),
+                pose_copy.latitude,
+                pose_copy.longitude,
+            ),
+            dtype=np.float64,
+        )
 
-        baseline_m = float(np.linalg.norm(baseline))
+        baseline_m = float(np.linalg.norm(origin_current_ecef - origin_anchor_ecef))
         if baseline_m < self.MIN_TRIANGULATION_BASELINE_M:
             self.statusBar().showMessage(
                 "Triangulation baseline too small. Move to a farther frame for accurate coordinates.",
@@ -2768,19 +2960,30 @@ class MainWindow(QMainWindow):
             )
             return
 
+        anchor_weight = self._triangulation_pose_weight(
+            horizontal_accuracy_m=anchor_frame.horizontal_accuracy_m,
+            heading_accuracy_deg=anchor_frame.heading_accuracy_deg,
+        )
+        current_weight = self._triangulation_pose_weight(
+            horizontal_accuracy_m=current_frame.horizontal_accuracy_m,
+            heading_accuracy_deg=current_frame.heading_accuracy_deg,
+        )
+
         try:
             (
-                point_anchor_enu,
+                point_ecef,
                 residual_m,
                 range_anchor_m,
                 range_current_m,
                 positive_count,
                 intersection_angle_rad,
             ) = self._triangulate_with_direction_variants(
-                origin_a=np.zeros(3, dtype=np.float64),
-                direction_a=direction_a,
-                origin_b=baseline,
-                direction_b=direction_b,
+                origin_a=origin_anchor_ecef,
+                direction_a=direction_anchor_ecef,
+                origin_b=origin_current_ecef,
+                direction_b=direction_current_ecef,
+                weight_a=anchor_weight,
+                weight_b=current_weight,
             )
         except ValueError as exc:
             QMessageBox.warning(self, "Two-Frame Triangulation", str(exc))
@@ -2835,8 +3038,6 @@ class MainWindow(QMainWindow):
                 )
                 return
 
-        anchor_frame = self._active_capture.frames[anchor.frame_index]
-        current_frame = self._active_capture.frames[frame_index]
         uncertainty_m = self._estimate_triangulation_uncertainty_m(
             baseline_m=baseline_m,
             angle_rad=intersection_angle_rad,
@@ -2850,13 +3051,10 @@ class MainWindow(QMainWindow):
             current_hacc_m=current_frame.horizontal_accuracy_m,
         )
 
-        lat, lon, alt = geodesy.enu_to_geodetic(
-            point_anchor_enu[0],
-            point_anchor_enu[1],
-            point_anchor_enu[2],
-            anchor.pose.latitude,
-            anchor.pose.longitude,
-            anchor.pose.altitude,
+        lat, lon, alt = geodesy.ecef_to_geodetic(
+            float(point_ecef[0]),
+            float(point_ecef[1]),
+            float(point_ecef[2]),
         )
         east_cur, north_cur, up_cur = geodesy.geodetic_to_enu(
             lat,
