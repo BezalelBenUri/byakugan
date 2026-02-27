@@ -251,3 +251,66 @@ def triangulate_rays_closest_point(
     midpoint = 0.5 * (pa + pb)
     residual = float(np.linalg.norm(pa - pb))
     return midpoint, residual, float(ta), float(tb)
+
+
+def triangulate_rays_weighted_least_squares(
+    origins: np.ndarray,
+    directions: np.ndarray,
+    weights: np.ndarray | None = None,
+    *,
+    epsilon: float = 1e-9,
+) -> Tuple[np.ndarray, float, np.ndarray]:
+    """Estimate point minimizing weighted squared distances to rays.
+
+    This solves the normal equations:
+      (sum w_i * (I - d_i d_i^T)) x = sum w_i * (I - d_i d_i^T) o_i
+    where ``o_i`` are ray origins, ``d_i`` are unit ray directions, and
+    ``w_i`` are non-negative scalar weights.
+
+    Returns:
+        point: Least-squares 3D point estimate.
+        residual_rms_m: Root-mean-square orthogonal distance to rays.
+        ranges: Signed slant ranges from each origin to the projected point.
+    """
+    o = np.asarray(origins, dtype=np.float64)
+    d = np.asarray(directions, dtype=np.float64)
+    if o.ndim != 2 or d.ndim != 2 or o.shape != d.shape or o.shape[1] != 3:
+        raise ValueError("origins and directions must be (N,3) arrays with matching shape.")
+    n = o.shape[0]
+    if n < 2:
+        raise ValueError("At least two rays are required for triangulation.")
+
+    norms = np.linalg.norm(d, axis=1)
+    if np.any(norms <= epsilon):
+        raise ValueError("Triangulation direction vector is degenerate.")
+    d_unit = d / norms[:, None]
+
+    if weights is None:
+        w = np.ones(n, dtype=np.float64)
+    else:
+        w = np.asarray(weights, dtype=np.float64).reshape(-1)
+        if w.shape[0] != n:
+            raise ValueError("weights must have length N.")
+        w = np.clip(w, 0.0, None)
+    if float(np.sum(w)) <= epsilon:
+        raise ValueError("Triangulation weights are all zero.")
+
+    ident = np.eye(3, dtype=np.float64)
+    lhs = np.zeros((3, 3), dtype=np.float64)
+    rhs = np.zeros(3, dtype=np.float64)
+    for idx in range(n):
+        projector = ident - np.outer(d_unit[idx], d_unit[idx])
+        lhs += w[idx] * projector
+        rhs += w[idx] * (projector @ o[idx])
+
+    cond = float(np.linalg.cond(lhs))
+    if not math.isfinite(cond) or cond > 1e12:
+        raise ValueError("Rays are poorly conditioned for weighted triangulation.")
+
+    point = np.linalg.solve(lhs, rhs)
+
+    ranges = np.sum(d_unit * (point[None, :] - o), axis=1)
+    orth_vectors = np.cross(point[None, :] - o, d_unit, axis=1)
+    orth_distances = np.linalg.norm(orth_vectors, axis=1)
+    residual_rms = float(np.sqrt(np.average(np.square(orth_distances), weights=w)))
+    return point.astype(np.float64), residual_rms, ranges.astype(np.float64)
