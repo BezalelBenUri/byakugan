@@ -9,8 +9,12 @@ Byakugan is a native Python desktop application that lets Insta360 Pro2 users ex
 - Crosshair-based point picking that reports pixel indices, range/depth, ENU vectors, and lat/lon/alt in real time.
 - Depth map ingestion (grayscale or float) plus optional stereo reconstruction using OpenCV's `StereoSGBM`.
 - Ground-plane fallback mode for panorama-only measurements when no depth map is available.
-- Two-frame triangulation mode for panorama-only depth recovery using the same feature across two capture frames.
-- Quality-gated triangulation (baseline, intersection angle, residual) with uncertainty estimates driven by frame metadata.
+- Multi-frame robust triangulation mode for panorama-only depth recovery using repeated clicks of the same feature across capture frames.
+- Quality-gated triangulation (baseline, intersection angle, residual, inlier count) with uncertainty estimates driven by frame metadata.
+- OpenCV template-matching refinement that tightens second-frame click correspondence before triangulation.
+- OpenCV essential-matrix pose consistency checks (`findEssentialMat`, `recoverPose`, `triangulatePoints`) before accepting a frame pair.
+- Ceres-backed local bundle adjustment (point + pose perturbations with GNSS/heading priors) for higher coordinate stability across frames.
+- Smoothed trajectory pose solution (ENU Savitzky-Golay) to reduce GNSS jitter before geospatial solving.
 - Configurable camera pose inputs (lat, lon, altitude, compass bearing) and precise ENU to ECEF conversions via `pyproj`, applied to every measurement in real time.
 - Frame pitch/roll-aware ray projection for capture-sequence measurements.
 - Measurement history with CSV/JSON export for GIS pipelines and a depth-source readout for traceability.
@@ -40,12 +44,12 @@ python -m byakugan_app
 2. Provide the capture latitude, longitude, altitude (meters), and bearing (degrees clockwise from north).
 3. Optionally load a pre-computed depth map or generate depth from stereo via **Generate Depth Map...**.
 4. Measurement engine selection is automatic (no mode switch required):
-   - capture folders -> **Two-Frame Triangulation** first (highest non-depth accuracy)
+   - capture folders -> **Multi-Frame Triangulation** first (highest non-depth accuracy)
    - depth map available -> **Depth Map**
    - otherwise -> **Ground Plane** fallback
 5. Click within the viewer to record measurements; results show in the sidebar and measurement table.
 6. Use **Reset View (Front)** to re-center on the camera bearing whenever you update the pose.
-7. For higher panorama-only accuracy, prefer **Two-Frame Triangulation** with frames that have good camera baseline and clear feature visibility.
+7. For higher panorama-only accuracy, set an anchor point, then re-click the same feature across farther frames (more parallax improves robustness).
 
 ### Stitched capture folders
 Byakugan can load stitched capture exports directly via **Load Capture Folder...**.
@@ -56,6 +60,11 @@ Byakugan can load stitched capture exports directly via **Load Capture Folder...
 - `*-gps.txt` records are aligned to frames to enrich per-frame GNSS/heading accuracy metadata.
 
 See `docs/CAPTURE_WORKFLOW.md` for detailed schema and constraints.
+
+### Raw 4-sensor folders
+Byakugan also parses raw i-Pulse-style folders (calibration, GPS, IMU, timestamps, sensor videos)
+for calibrated pre-stitch ray construction via backend APIs in `byakugan_app.io.raw_capture`.
+The desktop viewer still requires stitched panoramas for interactive rendering.
 
 A warning banner appears while the default pose (0,0,0) is active; update the spin boxes for accurate absolute coordinates.
 
