@@ -15,10 +15,15 @@ def pixel_to_angles(u: int, v: int, width: int, height: int) -> Tuple[float, flo
     Returns a tuple (theta, phi) where theta is the azimuth in radians measured from
     the +X axis in the camera frame, increasing towards +Y, and phi is the elevation
     angle in radians measured from the XY plane (positive up).
+
+    Byakugan treats the horizontal centre of an equirectangular panorama as the
+    camera forward direction. This matches the stitched capture exports used by
+    the project, where the vehicle hood and road ahead are centered in the pano.
     """
     u_norm = (u + 0.5) / float(width)
     v_norm = (v + 0.5) / float(height)
-    theta = TWO_PI * u_norm
+    theta = (TWO_PI * u_norm) - math.pi
+    theta %= TWO_PI
     phi = (math.pi / 2.0) - (math.pi * v_norm)
     return theta, phi
 
@@ -26,7 +31,7 @@ def pixel_to_angles(u: int, v: int, width: int, height: int) -> Tuple[float, flo
 def angles_to_pixel(theta: float, phi: float, width: int, height: int) -> Tuple[int, int]:
     """Convert spherical angles to pixel indices (clamped to valid range)."""
     theta = theta % TWO_PI
-    u_norm = theta / TWO_PI
+    u_norm = ((theta + math.pi) % TWO_PI) / TWO_PI
     v_norm = (math.pi / 2.0 - phi) / math.pi
 
     u = int(np.clip(u_norm * width - 0.5, 0, width - 1))
