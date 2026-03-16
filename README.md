@@ -5,7 +5,7 @@ Byakugan is a native Python desktop application that lets Insta360 Pro2 users ex
 ## Key Features
 - GPU-accelerated panorama viewer with smooth pan, tilt, zoom, and keyboard-assisted navigation.
 - Auto-detects stereo 360 formats (top-bottom or side-by-side) and offers one-click depth reconstruction.
-- Bearing-aware initial orientation and reset view controls aligned with the camera compass bearing.
+- Front-aligned panorama reset that keeps the stitched camera forward direction at the center of the view.
 - Crosshair-based point picking that reports pixel indices, range/depth, ENU vectors, and lat/lon/alt in real time.
 - Depth map ingestion (grayscale or float) plus optional stereo reconstruction using OpenCV's `StereoSGBM`.
 - Ground-plane fallback mode for panorama-only measurements when no depth map is available.
