@@ -15,6 +15,7 @@ dependencies = [
   "numpy>=1.24",
   "opencv-python>=4.8",
   "scipy>=1.11",
+  "pyceres>=2.6; platform_system == 'Windows'",
   "pyproj>=3.6",
   "Pillow>=9.5",
   "loguru>=0.7"
