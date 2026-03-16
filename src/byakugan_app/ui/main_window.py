@@ -592,7 +592,7 @@ class MainWindow(QMainWindow):
         generate_depth_btn = QPushButton("Generate Depth Map...")
         self.reset_view_button = QPushButton("Reset View")
         self.reset_view_button.setEnabled(False)
-        self.reset_view_button.setToolTip("Snap back to the horizon/front using the current camera bearing.")
+        self.reset_view_button.setToolTip("Snap back to the panorama front and horizon.")
 
         self.format_combo = QComboBox()
         self.format_combo.setEnabled(False)
@@ -1134,8 +1134,6 @@ class MainWindow(QMainWindow):
 
 
     def _update_camera_pose(self) -> None:
-        prev_pose = self._state.metadata.camera_pose
-        prev_bearing = prev_pose.bearing if prev_pose is not None else 0.0
         pose = CameraPose(
             latitude=self.lat_field.value(),
             longitude=self.lon_field.value(),
@@ -1144,10 +1142,6 @@ class MainWindow(QMainWindow):
         )
         self._state.metadata.camera_pose = pose
         self.viewer.set_bearing_reference(pose.bearing_rad)
-        if self._state.has_image:
-            bearing_delta = abs(((pose.bearing - prev_bearing + 180.0) % 360.0) - 180.0)
-            if bearing_delta > 1e-6:
-                self._needs_reorient = True
         self._update_pose_warning()
         self._update_pose_summary()
         self._update_reset_button_state()
@@ -3211,16 +3205,15 @@ class MainWindow(QMainWindow):
         if not has_image:
             self.reset_view_button.setText("Reset View")
             self.reset_view_button.setToolTip(
-                "Snap back to the horizon/front using the current camera bearing."
+                "Snap back to the panorama front and horizon."
             )
             return
         label = "Reset View"
         if self._needs_reorient:
             label += " *"
         self.reset_view_button.setText(label)
-        pose = self._state.metadata.camera_pose
         self.reset_view_button.setToolTip(
-            f"Reset to the camera front/horizon (bearing {pose.bearing:.2f} deg)."
+            "Reset to the panorama front and horizon."
         )
 
     def _perform_reset_view(self) -> None:
@@ -3231,7 +3224,7 @@ class MainWindow(QMainWindow):
         self.viewer.set_instruction_visible(True)
         self._needs_reorient = False
         self._update_reset_button_state()
-        self.statusBar().showMessage("View reset to front/horizon", 2500)
+        self.statusBar().showMessage("View reset to panorama front/horizon", 2500)
 
     def _validate_depth_alignment(self) -> None:
 
