@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 @dataclass(slots=True)
@@ -27,6 +27,8 @@ class PointMeasurement:
     depth_m: float
     enu_vector: Tuple[float, float, float]
     geodetic: Tuple[float, float, float]
+    quality_score: Optional[float] = None
+    quality_label: str = "N/A"
 
     @property
     def latitude(self) -> float:
@@ -45,11 +47,13 @@ class PointMeasurement:
         return {
             "pixel_u": self.pixel.u,
             "pixel_v": self.pixel.v,
-            "depth_m": self.depth_m,
-            "enu_e": self.enu_vector[0],
-            "enu_n": self.enu_vector[1],
-            "enu_u": self.enu_vector[2],
-            "latitude": self.latitude,
-            "longitude": self.longitude,
-            "altitude": self.altitude,
+            "depth_m": round(float(self.depth_m), 6),
+            "enu_e": round(float(self.enu_vector[0]), 6),
+            "enu_n": round(float(self.enu_vector[1]), 6),
+            "enu_u": round(float(self.enu_vector[2]), 6),
+            "latitude": round(float(self.latitude), 6),
+            "longitude": round(float(self.longitude), 6),
+            "altitude": round(float(self.altitude), 6),
+            "quality_score": None if self.quality_score is None else round(float(self.quality_score), 2),
+            "quality_label": self.quality_label,
         }
