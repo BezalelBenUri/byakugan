@@ -67,7 +67,7 @@ class PanoramaWidget(QOpenGLWidget):
         self._pitch = 0.0
         self._initial_yaw = 0.0
         self._bearing_reference = 0.0
-        self._yaw_offset = math.pi
+        self._yaw_offset = 0.0
         self._fov_y = math.radians(75.0)
         self._min_fov = math.radians(20.0)
         self._max_fov = math.radians(120.0)
@@ -536,6 +536,9 @@ class PanoramaWidget(QOpenGLWidget):
         """Render a sphere with explicit equirectangular texture coordinates.
 
         The mapping is deterministic and independent of GLU quadric conventions.
+        The stitched panoramas used by Byakugan place the camera front at the
+        horizontal image centre, so the sphere longitude is rotated by 180 deg
+        relative to the texture seam.
         """
         lon_steps = self._sphere_lon_segments
         lat_steps = self._sphere_lat_segments
@@ -553,7 +556,7 @@ class PanoramaWidget(QOpenGLWidget):
             glBegin(GL_TRIANGLE_STRIP)
             for lon_idx in range(lon_steps + 1):
                 u = lon_idx / lon_steps
-                theta = u * (2.0 * math.pi)
+                theta = (u * (2.0 * math.pi)) - math.pi
                 cos_theta = math.cos(theta)
                 sin_theta = math.sin(theta)
 
@@ -575,7 +578,9 @@ class PanoramaWidget(QOpenGLWidget):
             glEnd()
 
     def _update_initial_orientation(self) -> None:
-        self._initial_yaw = self._normalize_angle(-self._bearing_reference)
+        # Viewer reset is image-front aligned; bearing is used by geodesy, not by
+        # display orientation. The stitched panorama already encodes front.
+        self._initial_yaw = 0.0
 
     def _hide_instructions(self) -> None:
         if self._instructions_visible:
