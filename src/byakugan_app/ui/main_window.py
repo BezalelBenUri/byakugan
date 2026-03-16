@@ -40,6 +40,7 @@ import cv2
 
 
 import numpy as np
+from scipy.signal import savgol_filter
 
 
 
@@ -180,12 +181,13 @@ from ..io.depth_utils import (
 
 from ..io.loader import StereoDepthConfig, compute_depth_from_stereo, load_depth_map, load_equirectangular_image
 from ..io.capture_sequence import StitchedCapture, discover_stitched_capture
+from ..io.raw_capture import RawCapture, discover_raw_capture
 
 
 
 
 from ..io.panorama_processing import FisheyeConversionParams, PanoramaInputFormat
-from ..math import geodesy, geometry
+from ..math import geodesy, geometry, multiview
 
 
 
@@ -218,14 +220,31 @@ from .measurement_table_model import MeasurementTableModel
 
 @dataclass(slots=True)
 class TriangulationAnchor:
-    """Stores the first ray/pose used for two-frame triangulation."""
+    """Stores the first ray/pose used for triangulation."""
 
     frame_index: int
     pose: CameraPose
+    pixel_u: int
+    pixel_v: int
     theta: float
     phi: float
     pitch_deg: float
     roll_deg: float
+
+
+@dataclass(slots=True)
+class TriangulationObservation:
+    """One frame-level ray observation used for multi-view triangulation."""
+
+    frame_index: int
+    pixel_u: int
+    pixel_v: int
+    theta: float
+    phi: float
+    origin_ecef: np.ndarray
+    direction_ecef: np.ndarray
+    horizontal_accuracy_m: Optional[float]
+    heading_accuracy_deg: Optional[float]
 
 
 
@@ -248,9 +267,26 @@ class MainWindow(QMainWindow):
     MEASUREMENT_MODE_GROUND = "ground_plane"
     MEASUREMENT_MODE_TRIANGULATION = "triangulation_2frame"
     MIN_TRIANGULATION_BASELINE_M = 0.50
-    MIN_TRIANGULATION_ANGLE_DEG = 1.50
+    MIN_TRIANGULATION_ANGLE_DEG = 2.00
     MAX_TRIANGULATION_RESIDUAL_M = 2.50
+    MAX_TRIANGULATION_RAY_ERROR_DEG = 1.25
+    MAX_TRIANGULATION_SIGMA_M = 3.50
+    HARD_MAX_TRIANGULATION_RAY_ERROR_DEG = 6.00
+    HARD_MAX_TRIANGULATION_SIGMA_M = 20.00
+    TRIANGULATION_RANSAC_THRESHOLD_M = 2.0
+    TRIANGULATION_HUBER_SCALE_M = 1.0
+    TRIANGULATION_MAX_TRACK_OBSERVATIONS = 6
+    TRIANGULATION_TEMPLATE_PATCH_RADIUS_PX = 14
+    TRIANGULATION_TEMPLATE_SEARCH_RADIUS_PX = 96
+    TRIANGULATION_MIN_TEMPLATE_SCORE = 0.28
+    TRIANGULATION_POSE_CHECK_WINDOW_RADIUS_PX = 180
+    TRIANGULATION_MIN_POSE_INLIER_RATIO = 0.20
+    TRIANGULATION_MAX_HEADING_ACC_DEG = 20.0
+    MAX_GROUND_PLANE_RANGE_M = 120.0
+    CAPTURE_SMOOTHING_MIN_FRAMES = 11
+    CAPTURE_SMOOTHING_MAX_WINDOW = 41
     CAPTURE_HORIZONTAL_FLIP = True
+    MIN_TRAJECTORY_BEARING_BASELINE_M = 1.5
     MIN_BEARING_CALIBRATION_BASELINE_M = 1.0
     MIN_BEARING_CALIBRATION_SAMPLES = 24
     MIN_BEARING_CALIBRATION_CONCENTRATION = 0.60
@@ -305,6 +341,7 @@ class MainWindow(QMainWindow):
         self._format_combo_block = False
         self._syncing_render_view = False
         self._active_capture: Optional[StitchedCapture] = None
+        self._active_raw_capture: Optional[RawCapture] = None
         self._capture_spin_block = False
         self._capture_base_roll_offset_deg = 0.0
         self._pose_pitch_deg = 0.0
@@ -312,12 +349,15 @@ class MainWindow(QMainWindow):
         self._manual_roll_correction_deg = 0.0
         self._measurement_mode = self.MEASUREMENT_MODE_AUTO
         self._triangulation_anchor: Optional[TriangulationAnchor] = None
+        self._triangulation_track_observations: list[TriangulationObservation] = []
         self._measurement_history: list[PointMeasurement] = []
         self._measurement_marker_angles: list[tuple[float, float]] = []
         self._measurement_marker_frames: list[Optional[int]] = []
         self._capture_horizontal_flip_enabled = self.CAPTURE_HORIZONTAL_FLIP
         self._capture_bearing_offset_deg = 0.0
         self._capture_resolved_bearings_deg: list[float] = []
+        self._capture_resolved_positions: list[tuple[float, float, float]] = []
+        self._capture_gray_cache: dict[int, np.ndarray] = {}
 
         self._build_ui()
 
@@ -760,7 +800,7 @@ class MainWindow(QMainWindow):
         form.addRow("Pose Context", self.pose_summary_label)
 
         mode_hint = QLabel(
-            "Automatic engine selection: Two-Frame Triangulation (capture folders), "
+            "Automatic engine selection: Multi-Frame Triangulation (capture folders), "
             "Depth Map (if loaded), or Ground Plane fallback."
         )
         mode_hint.setWordWrap(True)
@@ -1137,6 +1177,21 @@ class MainWindow(QMainWindow):
         """Wrap an angle difference into [-180, 180) degrees."""
         return ((float(value_deg) + 180.0) % 360.0) - 180.0
 
+    @staticmethod
+    def _circular_weighted_mean_deg(values_deg: list[float], weights: list[float]) -> Optional[float]:
+        """Return weighted circular mean in degrees, or None if degenerate."""
+        if not values_deg or len(values_deg) != len(weights):
+            return None
+        w = np.asarray(weights, dtype=np.float64)
+        if w.size == 0 or float(np.sum(w)) <= 1e-9:
+            return None
+        angles = np.radians(np.asarray(values_deg, dtype=np.float64))
+        x = float(np.sum(w * np.cos(angles)))
+        y = float(np.sum(w * np.sin(angles)))
+        if abs(x) <= 1e-12 and abs(y) <= 1e-12:
+            return None
+        return math.degrees(math.atan2(y, x)) % 360.0
+
     def _resolve_raw_frame_bearing_deg(self, frame) -> float:
         """Resolve per-frame bearing from export metadata only.
 
@@ -1172,13 +1227,88 @@ class MainWindow(QMainWindow):
             return float(self._capture_resolved_bearings_deg[frame_index]) % 360.0
         return (self._resolve_raw_frame_bearing_deg(frame) + self._capture_bearing_offset_deg) % 360.0
 
+    def _estimate_trajectory_bearing_for_frame(
+        self,
+        capture: StitchedCapture,
+        frame_index: int,
+    ) -> tuple[Optional[float], Optional[float], float]:
+        """Estimate frame travel direction from neighboring geodetic positions."""
+        if frame_index < 0 or frame_index >= capture.frame_count:
+            return None, None, 0.0
+
+        frame = capture.frames[frame_index]
+
+        def _course_between(idx_a: int, idx_b: int) -> tuple[Optional[float], float]:
+            if idx_a < 0 or idx_b < 0 or idx_a >= capture.frame_count or idx_b >= capture.frame_count:
+                return None, 0.0
+            fa = capture.frames[idx_a]
+            fb = capture.frames[idx_b]
+            course_deg, _, distance_m = geodesy.geodesic_inverse(
+                fa.latitude,
+                fa.longitude,
+                fb.latitude,
+                fb.longitude,
+            )
+            if distance_m < self.MIN_TRAJECTORY_BEARING_BASELINE_M:
+                return None, distance_m
+            return course_deg, distance_m
+
+        central_course, central_baseline = _course_between(frame_index - 1, frame_index + 1)
+        if central_course is not None:
+            hacc = frame.horizontal_accuracy_m if frame.horizontal_accuracy_m is not None else 2.0
+            hacc = float(np.clip(hacc, 0.3, 50.0))
+            sigma_deg = math.degrees(math.atan2(math.sqrt(2.0) * hacc, max(central_baseline, 1e-3)))
+            return central_course, max(0.5, sigma_deg), central_baseline
+
+        forward_course, forward_baseline = _course_between(frame_index, frame_index + 1)
+        backward_course, backward_baseline = _course_between(frame_index - 1, frame_index)
+        if forward_course is None and backward_course is None:
+            return None, None, max(forward_baseline, backward_baseline)
+
+        candidates: list[float] = []
+        candidate_weights: list[float] = []
+        if forward_course is not None:
+            candidates.append(forward_course)
+            candidate_weights.append(max(forward_baseline, 1e-3))
+        if backward_course is not None:
+            candidates.append(backward_course)
+            candidate_weights.append(max(backward_baseline, 1e-3))
+        blended_course = self._circular_weighted_mean_deg(candidates, candidate_weights)
+        if blended_course is None:
+            return None, None, max(forward_baseline, backward_baseline)
+
+        hacc = frame.horizontal_accuracy_m if frame.horizontal_accuracy_m is not None else 2.0
+        hacc = float(np.clip(hacc, 0.3, 50.0))
+        baseline_m = max(forward_baseline, backward_baseline)
+        sigma_deg = math.degrees(math.atan2(math.sqrt(2.0) * hacc, max(baseline_m, 1e-3)))
+        return blended_course, max(0.5, sigma_deg), baseline_m
+
+    def _fuse_frame_heading_with_trajectory(self, capture: StitchedCapture, frame_index: int) -> float:
+        """Fuse frame heading with trajectory-derived course direction."""
+        frame = capture.frames[frame_index]
+        heading_deg = self._resolve_raw_frame_bearing_deg(frame)
+        heading_sigma_deg = frame.heading_accuracy_deg if frame.heading_accuracy_deg is not None else 3.0
+        heading_sigma_deg = float(np.clip(heading_sigma_deg, 0.5, 45.0))
+
+        course_deg, course_sigma_deg, _ = self._estimate_trajectory_bearing_for_frame(capture, frame_index)
+        if course_deg is None or course_sigma_deg is None:
+            return heading_deg
+
+        w_heading = 1.0 / max(heading_sigma_deg * heading_sigma_deg, 1e-6)
+        w_course = 1.0 / max(course_sigma_deg * course_sigma_deg, 1e-6)
+        blended = self._circular_weighted_mean_deg([heading_deg, course_deg], [w_heading, w_course])
+        return heading_deg if blended is None else blended
+
     def _build_capture_bearing_solution(self, capture: StitchedCapture) -> list[float]:
-        """Build per-frame bearings after trajectory-based boresight calibration."""
+        """Build per-frame bearings after heading-course fusion and boresight calibration."""
         if capture.frame_count <= 0:
             self._capture_bearing_offset_deg = 0.0
             return []
 
-        raw_bearings = [self._resolve_raw_frame_bearing_deg(frame) for frame in capture.frames]
+        raw_bearings = [
+            self._fuse_frame_heading_with_trajectory(capture, frame_index)
+            for frame_index in range(capture.frame_count)
+        ]
         offset_deg = self._estimate_capture_bearing_offset_deg(capture, raw_bearings)
         self._capture_bearing_offset_deg = offset_deg
         return [((bearing + offset_deg) % 360.0) for bearing in raw_bearings]
@@ -1242,6 +1372,370 @@ class MainWindow(QMainWindow):
 
         return math.degrees(math.atan2(y, x))
 
+    def _build_capture_position_solution(self, capture: StitchedCapture) -> list[tuple[float, float, float]]:
+        """Build a smoothed per-frame geodetic trajectory for measurement math.
+
+        The smoothing runs in local ENU space to preserve metric continuity and
+        reduce frame-to-frame GNSS jitter that amplifies triangulation noise.
+        """
+        if capture.frame_count <= 0:
+            return []
+
+        raw_geodetic = [(f.latitude, f.longitude, f.altitude_m) for f in capture.frames]
+        if capture.frame_count < self.CAPTURE_SMOOTHING_MIN_FRAMES:
+            return raw_geodetic
+
+        origin_lat, origin_lon, origin_alt = raw_geodetic[0]
+        enu = np.array(
+            [
+                geodesy.geodetic_to_enu(lat, lon, alt, origin_lat, origin_lon, origin_alt)
+                for lat, lon, alt in raw_geodetic
+            ],
+            dtype=np.float64,
+        )
+
+        window = min(self.CAPTURE_SMOOTHING_MAX_WINDOW, capture.frame_count)
+        if window % 2 == 0:
+            window -= 1
+        if window < 5:
+            return raw_geodetic
+
+        smooth_e = savgol_filter(enu[:, 0], window_length=window, polyorder=3, mode="interp")
+        smooth_n = savgol_filter(enu[:, 1], window_length=window, polyorder=3, mode="interp")
+        smooth_u = savgol_filter(enu[:, 2], window_length=window, polyorder=2, mode="interp")
+
+        smoothed: list[tuple[float, float, float]] = []
+        for east, north, up in zip(smooth_e, smooth_n, smooth_u):
+            lat, lon, alt = geodesy.enu_to_geodetic(
+                float(east),
+                float(north),
+                float(up),
+                origin_lat,
+                origin_lon,
+                origin_alt,
+            )
+            smoothed.append((lat, lon, alt))
+        return smoothed
+
+    def _resolve_frame_position(self, frame_index: int) -> tuple[float, float, float]:
+        """Return resolved frame geodetic position (smoothed when available)."""
+        capture = self._active_capture
+        if (
+            capture is not None
+            and 0 <= frame_index < len(self._capture_resolved_positions)
+            and frame_index < capture.frame_count
+        ):
+            return self._capture_resolved_positions[frame_index]
+        if capture is None or frame_index < 0 or frame_index >= capture.frame_count:
+            pose = self._state.metadata.camera_pose
+            return (pose.latitude, pose.longitude, pose.altitude)
+        frame = capture.frames[frame_index]
+        return (frame.latitude, frame.longitude, frame.altitude_m)
+
+    def _capture_frame_gray(self, frame_index: int) -> Optional[np.ndarray]:
+        """Load (or fetch cached) grayscale frame for local correspondence refinement."""
+        if frame_index in self._capture_gray_cache:
+            return self._capture_gray_cache[frame_index]
+        if self._active_capture is None or frame_index < 0 or frame_index >= self._active_capture.frame_count:
+            return None
+        frame = self._active_capture.frames[frame_index]
+        image = load_equirectangular_image(frame.image_path)
+        image = self._prepare_capture_frame_image(image)
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+        self._capture_gray_cache[frame_index] = gray
+        return gray
+
+    @staticmethod
+    def _extract_wrapped_patch(gray: np.ndarray, center_u: int, center_v: int, radius_px: int) -> Optional[np.ndarray]:
+        """Extract a square patch with horizontal wrap-around support."""
+        height, width = gray.shape[:2]
+        if radius_px <= 0 or height <= 0 or width <= 0:
+            return None
+        top = center_v - radius_px
+        bottom = center_v + radius_px + 1
+        if top < 0 or bottom > height:
+            return None
+        cols = (np.arange(center_u - radius_px, center_u + radius_px + 1, dtype=np.int64) % width).astype(np.int64)
+        return np.ascontiguousarray(gray[top:bottom][:, cols])
+
+    def _refine_click_with_template_match(
+        self,
+        *,
+        anchor_frame_index: int,
+        anchor_u: int,
+        anchor_v: int,
+        current_frame_index: int,
+        current_u: int,
+        current_v: int,
+        width: int,
+        height: int,
+    ) -> tuple[int, int, float]:
+        """Refine clicked correspondence in current frame using OpenCV template matching."""
+        if anchor_frame_index == current_frame_index:
+            return current_u, current_v, 1.0
+        anchor_gray = self._capture_frame_gray(anchor_frame_index)
+        current_gray = self._capture_frame_gray(current_frame_index)
+        if anchor_gray is None or current_gray is None:
+            return current_u, current_v, 0.0
+
+        patch_radius = self.TRIANGULATION_TEMPLATE_PATCH_RADIUS_PX
+        search_radius = self.TRIANGULATION_TEMPLATE_SEARCH_RADIUS_PX
+        patch = self._extract_wrapped_patch(anchor_gray, anchor_u, anchor_v, patch_radius)
+        if patch is None:
+            return current_u, current_v, 0.0
+
+        tile = np.concatenate((current_gray, current_gray, current_gray), axis=1)
+        center_u = current_u + width
+        x0 = center_u - search_radius - patch_radius
+        x1 = center_u + search_radius + patch_radius + 1
+        y0 = max(0, current_v - search_radius - patch_radius)
+        y1 = min(height, current_v + search_radius + patch_radius + 1)
+        if x0 < 0 or x1 > tile.shape[1] or y1 - y0 < patch.shape[0] or x1 - x0 < patch.shape[1]:
+            return current_u, current_v, 0.0
+
+        search = tile[y0:y1, x0:x1]
+        response = cv2.matchTemplate(search, patch, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(response)
+        refined_u = int((x0 + max_loc[0] + patch_radius) % width)
+        refined_v = int(np.clip(y0 + max_loc[1] + patch_radius, 0, height - 1))
+        return refined_u, refined_v, float(max_val)
+
+    def _build_triangulation_observation(
+        self,
+        *,
+        frame_index: int,
+        pixel_u: int,
+        pixel_v: int,
+        theta: float,
+        phi: float,
+        pitch_deg: float,
+        roll_deg: float,
+        heading_accuracy_deg: Optional[float],
+        horizontal_accuracy_m: Optional[float],
+    ) -> TriangulationObservation:
+        """Build one triangulation ray observation in ECEF coordinates."""
+        lat, lon, alt = self._resolve_frame_position(frame_index)
+        bearing_deg = (
+            self._capture_resolved_bearings_deg[frame_index]
+            if 0 <= frame_index < len(self._capture_resolved_bearings_deg)
+            else self._state.metadata.camera_pose.bearing
+        )
+        direction_enu = np.array(
+            geometry.enu_vector_from_angles(
+                theta,
+                phi,
+                1.0,
+                math.radians(bearing_deg),
+                pitch_rad=math.radians(pitch_deg),
+                roll_rad=math.radians(roll_deg),
+            ),
+            dtype=np.float64,
+        )
+        direction_ecef = np.array(
+            geodesy.enu_to_ecef(
+                float(direction_enu[0]),
+                float(direction_enu[1]),
+                float(direction_enu[2]),
+                lat,
+                lon,
+            ),
+            dtype=np.float64,
+        )
+        origin_ecef = np.array(geodesy.geodetic_to_ecef(lon, lat, alt), dtype=np.float64)
+        return TriangulationObservation(
+            frame_index=frame_index,
+            pixel_u=pixel_u,
+            pixel_v=pixel_v,
+            theta=theta,
+            phi=phi,
+            origin_ecef=origin_ecef,
+            direction_ecef=direction_ecef,
+            horizontal_accuracy_m=horizontal_accuracy_m,
+            heading_accuracy_deg=heading_accuracy_deg,
+        )
+
+    @staticmethod
+    def _upsert_triangulation_observation(
+        observations: list[TriangulationObservation],
+        observation: TriangulationObservation,
+    ) -> list[TriangulationObservation]:
+        """Insert or replace a per-frame observation in the active track."""
+        next_obs = [obs for obs in observations if obs.frame_index != observation.frame_index]
+        next_obs.append(observation)
+        next_obs.sort(key=lambda item: item.frame_index)
+        return next_obs
+
+    def _recommend_triangulation_frames(self, anchor_frame_index: int, limit: int = 3) -> list[int]:
+        """Suggest frame indices likely to provide stronger parallax than adjacent frames."""
+        capture = self._active_capture
+        if capture is None or capture.frame_count < 2:
+            return []
+        if anchor_frame_index < 0 or anchor_frame_index >= capture.frame_count:
+            return []
+        anchor_frame = capture.frames[anchor_frame_index]
+        anchor_lat, anchor_lon, _ = self._resolve_frame_position(anchor_frame_index)
+        candidates: list[tuple[float, int]] = []
+        for frame_index, frame in enumerate(capture.frames):
+            if frame_index == anchor_frame_index:
+                continue
+            if not self._frame_heading_usable(frame):
+                continue
+            lat, lon, _ = self._resolve_frame_position(frame_index)
+            _, _, baseline_m = geodesy.geodesic_inverse(anchor_lat, anchor_lon, lat, lon)
+            if baseline_m < self.MIN_TRIANGULATION_BASELINE_M:
+                continue
+            hacc = frame.horizontal_accuracy_m if frame.horizontal_accuracy_m is not None else 2.0
+            headacc = frame.heading_accuracy_deg if frame.heading_accuracy_deg is not None else 3.0
+            anchor_headacc = (
+                anchor_frame.heading_accuracy_deg
+                if anchor_frame.heading_accuracy_deg is not None
+                else 3.0
+            )
+            sigma_deg = math.hypot(max(0.5, float(headacc)), max(0.5, float(anchor_headacc)))
+            sigma_rad = math.radians(sigma_deg)
+            # Predict pair angle from baseline and a conservative 25 m feature range.
+            predicted_angle_rad = math.atan2(max(baseline_m, 1e-3), 25.0)
+            predicted_sigma_m = (25.0 * sigma_rad) / max(math.sin(predicted_angle_rad), 1e-3)
+            score = baseline_m / max(0.5, predicted_sigma_m + float(hacc))
+            candidates.append((score, frame_index))
+        candidates.sort(reverse=True)
+        return [frame_idx for _, frame_idx in candidates[: max(1, limit)]]
+
+    def _extract_wrapped_window(
+        self,
+        gray: np.ndarray,
+        center_u: int,
+        center_v: int,
+        radius_px: int,
+    ) -> tuple[Optional[np.ndarray], Optional[tuple[int, int]]]:
+        """Extract a square window around a pixel with horizontal wrap-around."""
+        height, width = gray.shape[:2]
+        if radius_px <= 0:
+            return None, None
+        top = center_v - radius_px
+        bottom = center_v + radius_px + 1
+        if top < 0 or bottom > height:
+            return None, None
+        cols = (np.arange(center_u - radius_px, center_u + radius_px + 1, dtype=np.int64) % width).astype(np.int64)
+        patch = np.ascontiguousarray(gray[top:bottom][:, cols])
+        return patch, (top, int((center_u - radius_px) % width))
+
+    def _frame_heading_usable(self, frame) -> bool:
+        """Return whether frame heading accuracy is strong enough for triangulation."""
+        if frame.heading_accuracy_deg is None:
+            return True
+        return float(frame.heading_accuracy_deg) <= self.TRIANGULATION_MAX_HEADING_ACC_DEG
+
+    def _pair_pose_consistency_opencv(
+        self,
+        *,
+        anchor_frame_index: int,
+        anchor_u: int,
+        anchor_v: int,
+        current_frame_index: int,
+        current_u: int,
+        current_v: int,
+        width: int,
+        height: int,
+    ) -> Optional[tuple[float, bool]]:
+        """Estimate pairwise pose consistency via OpenCV essential geometry.
+
+        Returns:
+            (inlier_ratio, cheirality_ok) or ``None`` when insufficient matches.
+        """
+        if anchor_frame_index == current_frame_index:
+            return None
+        anchor_gray = self._capture_frame_gray(anchor_frame_index)
+        current_gray = self._capture_frame_gray(current_frame_index)
+        if anchor_gray is None or current_gray is None:
+            return None
+
+        radius = self.TRIANGULATION_POSE_CHECK_WINDOW_RADIUS_PX
+        patch_a, _ = self._extract_wrapped_window(anchor_gray, anchor_u, anchor_v, radius)
+        patch_b, _ = self._extract_wrapped_window(current_gray, current_u, current_v, radius)
+        if patch_a is None or patch_b is None:
+            return None
+
+        orb = cv2.ORB_create(nfeatures=500, fastThreshold=12)
+        kp_a, des_a = orb.detectAndCompute(patch_a, None)
+        kp_b, des_b = orb.detectAndCompute(patch_b, None)
+        if des_a is None or des_b is None or len(kp_a) < 24 or len(kp_b) < 24:
+            return None
+
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        knn = matcher.knnMatch(des_a, des_b, k=2)
+        good = []
+        for pair in knn:
+            if len(pair) < 2:
+                continue
+            m, n = pair
+            if m.distance < 0.75 * n.distance:
+                good.append(m)
+        if len(good) < 20:
+            return None
+
+        def to_global(match_point: cv2.KeyPoint, center_u_px: int, center_v_px: int) -> tuple[float, float]:
+            x_local = float(match_point.pt[0])
+            y_local = float(match_point.pt[1])
+            u_px = (center_u_px - radius + x_local) % width
+            v_px = float(np.clip(center_v_px - radius + y_local, 0.0, float(height - 1)))
+            return float(u_px), v_px
+
+        pts1 = []
+        pts2 = []
+        for match in good:
+            u1, v1 = to_global(kp_a[match.queryIdx], anchor_u, anchor_v)
+            u2, v2 = to_global(kp_b[match.trainIdx], current_u, current_v)
+            pts1.append((u1, v1))
+            pts2.append((u2, v2))
+        points1 = np.asarray(pts1, dtype=np.float64)
+        points2 = np.asarray(pts2, dtype=np.float64)
+        if points1.shape[0] < 16:
+            return None
+
+        fx = width / (2.0 * math.pi)
+        fy = height / math.pi
+        cx = width / 2.0
+        cy = height / 2.0
+        k_mat = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        essential, mask = cv2.findEssentialMat(
+            points1,
+            points2,
+            cameraMatrix=k_mat,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=2.0,
+        )
+        if essential is None or mask is None:
+            return None
+        inlier_mask = mask.reshape(-1).astype(bool)
+        if int(np.count_nonzero(inlier_mask)) < 12:
+            return None
+        inlier_ratio = float(np.count_nonzero(inlier_mask) / max(1, points1.shape[0]))
+
+        _, r_mat, t_vec, pose_mask = cv2.recoverPose(
+            essential,
+            points1,
+            points2,
+            cameraMatrix=k_mat,
+            mask=mask,
+        )
+        if pose_mask is None:
+            return inlier_ratio, False
+
+        clicked1 = np.array([[float(anchor_u)], [float(anchor_v)]], dtype=np.float64)
+        clicked2 = np.array([[float(current_u)], [float(current_v)]], dtype=np.float64)
+        p1 = k_mat @ np.hstack((np.eye(3, dtype=np.float64), np.zeros((3, 1), dtype=np.float64)))
+        p2 = k_mat @ np.hstack((r_mat, t_vec.reshape(3, 1)))
+        triangulated = cv2.triangulatePoints(p1, p2, clicked1, clicked2)
+        if triangulated.shape[1] < 1:
+            return inlier_ratio, False
+        point_cam1 = triangulated[:3, 0] / max(1e-12, triangulated[3, 0])
+        point_cam2 = (r_mat @ point_cam1.reshape(3, 1)) + t_vec.reshape(3, 1)
+        cheirality_ok = bool(point_cam1[2] > 0.0 and point_cam2[2, 0] > 0.0)
+        return inlier_ratio, cheirality_ok
+
     def _apply_view_roll(self) -> None:
         """Apply pose-derived roll and manual operator offset to the viewer."""
         total_roll = self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg
@@ -1278,13 +1772,62 @@ class MainWindow(QMainWindow):
 
         capture_path = Path(folder)
         self.statusBar().showMessage("Scanning capture folder...")
-        task = FunctionTask(discover_stitched_capture, capture_path)
-        self._bind_task(task, self._capture_folder_loaded)
+        task = FunctionTask(self._discover_capture_folder_payload, capture_path)
+        self._bind_task(task, self._capture_folder_loaded_from_payload)
+
+    @staticmethod
+    def _discover_capture_folder_payload(path: Path) -> tuple[str, object]:
+        """Discover stitched or raw capture folders with one unified task API."""
+        try:
+            stitched = discover_stitched_capture(path)
+            return ("stitched", stitched)
+        except Exception as stitched_error:
+            try:
+                raw = discover_raw_capture(path)
+                return ("raw", raw)
+            except Exception:
+                raise stitched_error
+
+    def _capture_folder_loaded_from_payload(self, payload: tuple[str, object]) -> None:
+        """Route loaded folder payload to stitched or raw handlers."""
+        kind, value = payload
+        if kind == "stitched":
+            self._capture_folder_loaded(value)  # type: ignore[arg-type]
+            return
+        if kind == "raw":
+            self._raw_capture_loaded(value)  # type: ignore[arg-type]
+            return
+        raise ValueError(f"Unsupported capture payload kind: {kind}")
+
+    def _raw_capture_loaded(self, capture: RawCapture) -> None:
+        """Load raw capture metadata for calibrated-sensor backend workflows."""
+        self._clear_active_capture()
+        self._active_raw_capture = capture
+        frame_count = min(len(capture.sensor_timestamps_ns[idx]) for idx in capture.sensor_timestamps_ns)
+        self.capture_status_label.setText(
+            "Raw capture loaded (4-sensor). "
+            f"Frames/sensor: {frame_count} | Folder: {capture.capture_root}"
+        )
+        self.capture_status_label.setToolTip(str(capture.capture_root))
+        self.statusBar().showMessage(
+            "Raw capture parsed. Calibrated sensor-ray solver is available for pipeline integration.",
+            5000,
+        )
+        QMessageBox.information(
+            self,
+            "Raw Capture Loaded",
+            "Raw 4-sensor capture was parsed successfully.\n"
+            "Viewer-based triangulation still uses stitched panoramas.\n"
+            "Use the calibrated raw-sensor APIs for pre-stitch geospatial solving.",
+        )
 
     def _capture_folder_loaded(self, capture: StitchedCapture) -> None:
+        self._active_raw_capture = None
         self._active_capture = capture
         self._capture_base_roll_offset_deg = 0.0
         self._capture_resolved_bearings_deg = self._build_capture_bearing_solution(capture)
+        self._capture_resolved_positions = self._build_capture_position_solution(capture)
+        self._capture_gray_cache.clear()
         self._clear_measurement_history()
         self._clear_triangulation_anchor(update_label=True)
         self._on_measurement_mode_changed(self.measurement_mode_combo.currentIndex())
@@ -1305,7 +1848,8 @@ class MainWindow(QMainWindow):
         self.capture_status_label.setToolTip(str(capture.capture_root))
         self.statusBar().showMessage(
             f"Capture folder validated: {capture.capture_root} "
-            f"(bearing calibration {self._capture_bearing_offset_deg:+.2f} deg)",
+            f"(bearing calibration {self._capture_bearing_offset_deg:+.2f} deg, "
+            f"trajectory smoothing {'on' if len(self._capture_resolved_positions) == capture.frame_count else 'off'})",
             4000,
         )
         self._load_capture_frame(0, reset_orientation=True)
@@ -1348,13 +1892,15 @@ class MainWindow(QMainWindow):
         self._pose_roll_deg = float(frame.roll_deg)
         self._apply_view_roll()
         self._state.set_image(image, frame.image_path)
+        self._capture_gray_cache[frame_index] = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
         self._refresh_viewer_image(reset_orientation=reset_orientation)
         self.viewer.set_instruction_visible(frame_index == 0)
         resolved_bearing_deg = self._resolve_frame_bearing_deg(frame, frame_index)
+        resolved_lat, resolved_lon, resolved_alt = self._resolve_frame_position(frame_index)
         self._set_camera_pose_fields(
-            latitude=frame.latitude,
-            longitude=frame.longitude,
-            altitude=frame.altitude_m,
+            latitude=resolved_lat,
+            longitude=resolved_lon,
+            altitude=resolved_alt,
             bearing=resolved_bearing_deg,
         )
 
@@ -1387,9 +1933,12 @@ class MainWindow(QMainWindow):
 
     def _clear_active_capture(self) -> None:
         self._active_capture = None
+        self._active_raw_capture = None
         self._capture_base_roll_offset_deg = 0.0
         self._capture_bearing_offset_deg = 0.0
         self._capture_resolved_bearings_deg = []
+        self._capture_resolved_positions = []
+        self._capture_gray_cache.clear()
         self._pose_pitch_deg = 0.0
         self._pose_roll_deg = 0.0
         self._apply_view_roll()
@@ -2030,7 +2579,7 @@ class MainWindow(QMainWindow):
             camera_height = self.ground_height_spin.value() if hasattr(self, "ground_height_spin") else 1.7
             source = f"Ground plane estimate (camera height {camera_height:.2f} m)"
         elif effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
-            source = "Two-frame triangulation"
+            source = "Multi-frame triangulation"
         else:
             source = self._state.depth_source or "-"
         self.depth_source_label.setText(source)
@@ -2125,14 +2674,14 @@ class MainWindow(QMainWindow):
                 else:
                     self.triangulation_label.setText(
                         f"Anchor frame {self._triangulation_anchor.frame_index} set. "
-                        "Step 2: switch frame and click same feature."
+                        "Step 2: switch frame and click same feature (extra frames improve accuracy)."
                     )
             else:
                 self.triangulation_label.setText("Not active")
         self._update_depth_source_label()
 
         if effective_mode == self.MEASUREMENT_MODE_TRIANGULATION:
-            self.statusBar().showMessage("Measurement engine: Two-frame triangulation", 2500)
+            self.statusBar().showMessage("Measurement engine: Multi-frame triangulation", 2500)
         elif effective_mode == self.MEASUREMENT_MODE_DEPTH:
             self.statusBar().showMessage("Measurement engine: Depth map", 2500)
         else:
@@ -2149,6 +2698,8 @@ class MainWindow(QMainWindow):
 
     def _clear_triangulation_anchor(self, *, update_label: bool = True) -> None:
         self._triangulation_anchor = None
+        self._triangulation_track_observations.clear()
+        self._sync_viewer_measurement_markers()
         if update_label and hasattr(self, "triangulation_label"):
             if self._resolve_measurement_mode() == self.MEASUREMENT_MODE_TRIANGULATION:
                 self.triangulation_label.setText("Step 1: click feature in frame A")
@@ -2218,6 +2769,15 @@ class MainWindow(QMainWindow):
             theta, phi = theta_phi
             # Keep global point numbering stable across frame filters.
             markers.append((theta, phi, f"pt{point_index}"))
+        anchor = self._triangulation_anchor
+        if anchor is not None and (current_frame_index is None or anchor.frame_index == current_frame_index):
+            markers.append((anchor.theta, anchor.phi, "A"))
+        for observation in self._triangulation_track_observations:
+            if current_frame_index is None or observation.frame_index != current_frame_index:
+                continue
+            if anchor is not None and observation.frame_index == anchor.frame_index:
+                continue
+            markers.append((observation.theta, observation.phi, "T"))
         self.viewer.set_measurement_markers(markers)
 
     def _copy_selected_measurement_cells(self) -> None:
@@ -2275,6 +2835,10 @@ class MainWindow(QMainWindow):
             pitch_rad=pitch_rad,
             roll_rad=roll_rad,
         )
+        if depth_val > self.MAX_GROUND_PLANE_RANGE_M:
+            raise ValueError(
+                "Selected point is too close to the horizon for reliable ground-plane intersection."
+            )
         lat, lon, alt = geodesy.enu_to_geodetic(
             east,
             north,
@@ -2289,58 +2853,67 @@ class MainWindow(QMainWindow):
             depth_m=depth_val,
             enu_vector=(east, north, up),
             geodetic=(lat, lon, alt),
+            quality_score=40.0,
+            quality_label=self._quality_label_from_score(40.0),
         )
         local_vec = geometry.spherical_direction(theta, phi) * depth_val
         source = f"Ground plane estimate (camera height {camera_height_m:.2f} m)"
         return measurement, local_vec, source
 
-    def _triangulate_with_direction_variants(
+    def _triangulate_track_observations(
         self,
-        origin_a: np.ndarray,
-        direction_a: np.ndarray,
-        origin_b: np.ndarray,
-        direction_b: np.ndarray,
-        *,
-        weight_a: float = 1.0,
-        weight_b: float = 1.0,
-    ) -> tuple[np.ndarray, float, float, float, int, float]:
-        """Triangulate while tolerating 180-degree ray-direction ambiguity.
+        observations: list[TriangulationObservation],
+    ) -> tuple[multiview.RobustTriangulationResult, float, float]:
+        """Triangulate an active feature track using robust multi-view estimation.
 
-        A weighted least-squares line intersection is used so frames with
-        stronger GNSS confidence can contribute more than noisier frames.
+        Returns:
+            result: Robust point estimate and residual diagnostics.
+            median_angle_rad: Median pairwise intersection angle across inlier rays.
+            median_baseline_m: Median baseline between inlier camera origins.
         """
-        candidates: list[tuple[int, float, float, np.ndarray, float, float]] = []
-        origins = np.stack([origin_a, origin_b], axis=0)
-        weights = np.array([max(weight_a, 1e-6), max(weight_b, 1e-6)], dtype=np.float64)
-        for sign_a in (1.0, -1.0):
-            for sign_b in (1.0, -1.0):
-                direction_a_variant = direction_a * sign_a
-                direction_b_variant = direction_b * sign_b
-                try:
-                    point, residual_rms_m, ranges = geometry.triangulate_rays_weighted_least_squares(
-                        origins=origins,
-                        directions=np.stack([direction_a_variant, direction_b_variant], axis=0),
-                        weights=weights,
+        if len(observations) < 2:
+            raise ValueError("At least two observations are required for triangulation.")
+
+        origins = np.stack([obs.origin_ecef for obs in observations], axis=0)
+        directions = np.stack([obs.direction_ecef for obs in observations], axis=0)
+        weights = np.array(
+            [
+                self._triangulation_pose_weight(
+                    horizontal_accuracy_m=obs.horizontal_accuracy_m,
+                    heading_accuracy_deg=obs.heading_accuracy_deg,
+                )
+                for obs in observations
+            ],
+            dtype=np.float64,
+        )
+        result = multiview.triangulate_observations_robust(
+            origins=origins,
+            directions=directions,
+            weights=weights,
+            ransac_threshold_m=self.TRIANGULATION_RANSAC_THRESHOLD_M,
+            huber_scale_m=self.TRIANGULATION_HUBER_SCALE_M,
+            min_inliers=2,
+        )
+        inlier_indices = np.flatnonzero(result.inlier_mask)
+        if inlier_indices.size < 2:
+            inlier_indices = np.arange(len(observations), dtype=np.int64)
+
+        pair_angles: list[float] = []
+        baselines: list[float] = []
+        for idx, i in enumerate(inlier_indices):
+            for j in inlier_indices[idx + 1 :]:
+                pair_angles.append(
+                    geometry.acute_angle_between_vectors(
+                        observations[int(i)].direction_ecef,
+                        observations[int(j)].direction_ecef,
                     )
-                except ValueError:
-                    continue
-                range_a_m = float(ranges[0])
-                range_b_m = float(ranges[1])
-                # Keep residual semantics close to the previous two-ray
-                # closest-point metric by scaling RMS line distance.
-                residual_m = float(residual_rms_m * 2.0)
-                angle_rad = geometry.acute_angle_between_vectors(direction_a_variant, direction_b_variant)
-                positive_count = int(range_a_m > 0.0) + int(range_b_m > 0.0)
-                candidates.append((positive_count, angle_rad, residual_m, point, range_a_m, range_b_m))
-
-        if not candidates:
-            raise ValueError("Triangulation failed for all ray-direction variants.")
-
-        # Prefer forward intersections first, then stronger triangulation geometry,
-        # and finally tighter ray-to-ray residual.
-        candidates.sort(key=lambda item: (-item[0], -item[1], item[2]))
-        positive_count, angle_rad, residual_m, point, range_a_m, range_b_m = candidates[0]
-        return point, residual_m, range_a_m, range_b_m, positive_count, angle_rad
+                )
+                baselines.append(
+                    float(np.linalg.norm(observations[int(i)].origin_ecef - observations[int(j)].origin_ecef))
+                )
+        median_angle_rad = float(np.median(pair_angles)) if pair_angles else 0.0
+        median_baseline_m = float(np.median(baselines)) if baselines else 0.0
+        return result, median_angle_rad, median_baseline_m
 
     def _triangulation_pose_weight(
         self,
@@ -2356,21 +2929,54 @@ class MainWindow(QMainWindow):
         sigma_equiv = math.hypot(hacc, heading_acc * 0.1)
         return 1.0 / max(sigma_equiv * sigma_equiv, 1e-6)
 
-    def _estimate_triangulation_uncertainty_m(
+    @staticmethod
+    def _quality_label_from_score(score: Optional[float]) -> str:
+        """Map numeric quality score to label."""
+        if score is None or not math.isfinite(score):
+            return "N/A"
+        if score >= 85.0:
+            return "Excellent"
+        if score >= 70.0:
+            return "Good"
+        if score >= 50.0:
+            return "Fair"
+        return "Poor"
+
+    def _triangulation_quality_score(
         self,
         *,
         baseline_m: float,
+        angle_deg: float,
+        residual_m: float,
+        uncertainty_m: float,
+        ray_error_deg: float,
+    ) -> float:
+        """Compute bounded quality score for triangulated measurement."""
+        angle_term = min(1.0, max(0.0, angle_deg / 10.0))
+        baseline_term = min(1.0, max(0.0, baseline_m / 15.0))
+        residual_term = max(0.0, 1.0 - (residual_m / max(0.5, self.MAX_TRIANGULATION_RESIDUAL_M)))
+        sigma_term = max(0.0, 1.0 - (uncertainty_m / max(0.5, self.MAX_TRIANGULATION_SIGMA_M)))
+        ray_term = max(0.0, 1.0 - (ray_error_deg / max(0.25, self.MAX_TRIANGULATION_RAY_ERROR_DEG)))
+        score = 100.0 * (
+            (0.28 * angle_term)
+            + (0.20 * baseline_term)
+            + (0.22 * residual_term)
+            + (0.22 * sigma_term)
+            + (0.08 * ray_term)
+        )
+        return float(np.clip(score, 0.0, 100.0))
+
+    def _estimate_triangulation_uncertainty_m(
+        self,
+        *,
+        observations: list[TriangulationObservation],
+        ranges_m: np.ndarray,
+        baseline_m: float,
         angle_rad: float,
-        range_anchor_m: float,
-        range_current_m: float,
         image_width: int,
         image_height: int,
-        anchor_heading_acc_deg: Optional[float],
-        current_heading_acc_deg: Optional[float],
-        anchor_hacc_m: Optional[float],
-        current_hacc_m: Optional[float],
     ) -> float:
-        """Approximate 1-sigma position uncertainty for two-frame triangulation.
+        """Approximate 1-sigma uncertainty for robust multi-view triangulation.
 
         This combines three dominant terms:
         1) pixel click quantization on the panorama ray,
@@ -2385,21 +2991,22 @@ class MainWindow(QMainWindow):
         pixel_sigma_rad = math.hypot(pixel_sigma_theta, pixel_sigma_phi)
 
         heading_sigmas = [
-            math.radians(value)
-            for value in (anchor_heading_acc_deg, current_heading_acc_deg)
-            if value is not None and value > 0.0
+            math.radians(obs.heading_accuracy_deg)
+            for obs in observations
+            if obs.heading_accuracy_deg is not None and obs.heading_accuracy_deg > 0.0
         ]
         heading_sigma_rad = max(heading_sigmas) if heading_sigmas else 0.0
         angular_sigma_rad = math.hypot(pixel_sigma_rad, heading_sigma_rad)
 
-        representative_range = max(0.0, 0.5 * (range_anchor_m + range_current_m))
+        positive_ranges = [float(value) for value in np.asarray(ranges_m).tolist() if float(value) > 0.0]
+        representative_range = float(np.median(positive_ranges)) if positive_ranges else 0.0
         geometry_gain = 1.0 / max(math.sin(angle_rad), 1e-6)
         angular_component_m = representative_range * angular_sigma_rad * geometry_gain
 
         horizontal_sigmas = [
-            value
-            for value in (anchor_hacc_m, current_hacc_m)
-            if value is not None and value > 0.0
+            obs.horizontal_accuracy_m
+            for obs in observations
+            if obs.horizontal_accuracy_m is not None and obs.horizontal_accuracy_m > 0.0
         ]
         if horizontal_sigmas:
             pose_component_m = float(np.sqrt(np.mean(np.square(horizontal_sigmas))))
@@ -2795,11 +3402,14 @@ class MainWindow(QMainWindow):
         )
 
         pixel = PixelSelection(u=u, v=v, width=width, height=height)
+        depth_quality_score = 70.0 if "stereo" in source.lower() else 60.0
         measurement = PointMeasurement(
             pixel=pixel,
             depth_m=depth_val,
             enu_vector=(east, north, up),
             geodetic=(lat, lon, alt),
+            quality_score=depth_quality_score,
+            quality_label=self._quality_label_from_score(depth_quality_score),
         )
 
         self._append_measurement(
@@ -2829,18 +3439,19 @@ class MainWindow(QMainWindow):
         width: int,
         height: int,
     ) -> None:
-        """Handle one click in two-frame triangulation mode."""
-        if self._active_capture is None or self._active_capture.frame_count < 2:
+        """Handle one click in triangulation mode (multi-view capable)."""
+        capture = self._active_capture
+        if capture is None or capture.frame_count < 2:
             QMessageBox.warning(
                 self,
-                "Two-Frame Triangulation",
+                "Triangulation",
                 "Triangulation requires a loaded capture folder with at least 2 frames.",
             )
             return
 
         frame_index = self._current_capture_frame_index()
         if frame_index is None:
-            QMessageBox.warning(self, "Two-Frame Triangulation", "Unable to resolve active frame index.")
+            QMessageBox.warning(self, "Triangulation", "Unable to resolve active frame index.")
             return
 
         pose = self._state.metadata.camera_pose
@@ -2850,23 +3461,55 @@ class MainWindow(QMainWindow):
             altitude=pose.altitude,
             bearing=pose.bearing,
         )
+        frame = capture.frames[frame_index]
         pitch_deg = float(self._pose_pitch_deg)
         roll_deg = float(self._capture_base_roll_offset_deg + self._pose_roll_deg + self._manual_roll_correction_deg)
+
+        if not self._frame_heading_usable(frame):
+            suggested = self._recommend_triangulation_frames(frame_index, limit=3)
+            hint = f" Recommended frames: {', '.join(str(idx) for idx in suggested)}." if suggested else ""
+            self.statusBar().showMessage(
+                "Current frame has weak heading accuracy for triangulation."
+                f"{hint}",
+                5000,
+            )
+            return
 
         if self._triangulation_anchor is None or frame_index == self._triangulation_anchor.frame_index:
             self._triangulation_anchor = TriangulationAnchor(
                 frame_index=frame_index,
                 pose=pose_copy,
+                pixel_u=u,
+                pixel_v=v,
                 theta=theta,
                 phi=phi,
                 pitch_deg=pitch_deg,
                 roll_deg=roll_deg,
             )
+            anchor_observation = self._build_triangulation_observation(
+                frame_index=frame_index,
+                pixel_u=u,
+                pixel_v=v,
+                theta=theta,
+                phi=phi,
+                pitch_deg=pitch_deg,
+                roll_deg=roll_deg,
+                heading_accuracy_deg=frame.heading_accuracy_deg,
+                horizontal_accuracy_m=frame.horizontal_accuracy_m,
+            )
+            self._triangulation_track_observations = [anchor_observation]
             if hasattr(self, "triangulation_label"):
-                self.triangulation_label.setText(
-                    f"Anchor frame {frame_index} set. Step 2: switch frame and click same feature."
+                suggested_frames = self._recommend_triangulation_frames(frame_index, limit=3)
+                suggestion_text = (
+                    f" Suggested frames: {', '.join(str(idx) for idx in suggested_frames)}."
+                    if suggested_frames
+                    else ""
                 )
-            provisional_note = "Coordinate pending second frame click."
+                self.triangulation_label.setText(
+                    f"Anchor frame {frame_index} set. Step 2: switch frame and click the same feature."
+                    f"{suggestion_text}"
+                )
+            provisional_note = "Coordinate pending second-frame click."
             try:
                 provisional_measurement, provisional_vec, _ = self._build_ground_plane_measurement(
                     theta,
@@ -2876,6 +3519,8 @@ class MainWindow(QMainWindow):
                     width,
                     height,
                 )
+                provisional_measurement.quality_score = 25.0
+                provisional_measurement.quality_label = "Provisional"
                 self._append_measurement(
                     provisional_measurement,
                     marker_theta=theta,
@@ -2883,76 +3528,109 @@ class MainWindow(QMainWindow):
                     marker_frame_index=frame_index,
                 )
                 self._update_selection_labels(provisional_measurement, provisional_vec)
-                self.depth_source_label.setText("Triangulation anchor (provisional ground estimate)")
-                provisional_note = "Provisional coordinate shown; click same feature in another frame to refine."
+                self.depth_source_label.setText(
+                    "Triangulation anchor (provisional estimate; refine with second frame)"
+                )
+                provisional_note = "Provisional point saved. Switch frame and click same feature to refine."
             except ValueError:
-                # Ground fallback is not always possible (e.g. sky rays). Keep anchor and continue.
-                pass
+                pending_measurement = PointMeasurement(
+                    pixel=PixelSelection(u=u, v=v, width=width, height=height),
+                    depth_m=float("nan"),
+                    enu_vector=(float("nan"), float("nan"), float("nan")),
+                    geodetic=(float("nan"), float("nan"), float("nan")),
+                    quality_score=15.0,
+                    quality_label="Anchor",
+                )
+                self._append_measurement(
+                    pending_measurement,
+                    marker_theta=theta,
+                    marker_phi=phi,
+                    marker_frame_index=frame_index,
+                )
+                provisional_note = "Anchor saved. Switch frame and click same feature to compute coordinates."
+            self._sync_viewer_measurement_markers()
+            suggested_frames = self._recommend_triangulation_frames(frame_index, limit=2)
+            suffix = (
+                f" Suggested frame(s): {', '.join(str(idx) for idx in suggested_frames)}."
+                if suggested_frames
+                else ""
+            )
             self.statusBar().showMessage(
-                f"Triangulation anchor set at frame {frame_index}. {provisional_note}",
+                f"Triangulation anchor set at frame {frame_index}. {provisional_note}{suffix}",
                 4500,
             )
             return
 
         anchor = self._triangulation_anchor
-        assert anchor is not None  # for type checkers
+        assert anchor is not None
 
-        anchor_frame = self._active_capture.frames[anchor.frame_index]
-        current_frame = self._active_capture.frames[frame_index]
+        refined_u, refined_v, template_score = self._refine_click_with_template_match(
+            anchor_frame_index=anchor.frame_index,
+            anchor_u=anchor.pixel_u,
+            anchor_v=anchor.pixel_v,
+            current_frame_index=frame_index,
+            current_u=u,
+            current_v=v,
+            width=width,
+            height=height,
+        )
+        use_refined = template_score >= self.TRIANGULATION_MIN_TEMPLATE_SCORE
+        if use_refined:
+            u = refined_u
+            v = refined_v
+            theta, phi = geometry.pixel_to_angles(u, v, width, height)
 
-        origin_anchor_ecef = np.array(
-            geodesy.geodetic_to_ecef(anchor.pose.longitude, anchor.pose.latitude, anchor.pose.altitude),
-            dtype=np.float64,
+        pose_consistency = self._pair_pose_consistency_opencv(
+            anchor_frame_index=anchor.frame_index,
+            anchor_u=anchor.pixel_u,
+            anchor_v=anchor.pixel_v,
+            current_frame_index=frame_index,
+            current_u=u,
+            current_v=v,
+            width=width,
+            height=height,
         )
-        origin_current_ecef = np.array(
-            geodesy.geodetic_to_ecef(pose_copy.longitude, pose_copy.latitude, pose_copy.altitude),
-            dtype=np.float64,
-        )
+        if pose_consistency is not None:
+            inlier_ratio, cheirality_ok = pose_consistency
+            if inlier_ratio < self.TRIANGULATION_MIN_POSE_INLIER_RATIO or not cheirality_ok:
+                self.statusBar().showMessage(
+                    "OpenCV pose consistency check failed for this frame pair. "
+                    "Choose a farther frame or re-click the same feature.",
+                    5000,
+                )
+                return
+        else:
+            inlier_ratio = None
 
-        direction_anchor_enu = np.array(
-            geometry.enu_vector_from_angles(
-                anchor.theta,
-                anchor.phi,
-                1.0,
-                anchor.pose.bearing_rad,
-                pitch_rad=math.radians(anchor.pitch_deg),
-                roll_rad=math.radians(anchor.roll_deg),
-            ),
-            dtype=np.float64,
+        current_observation = self._build_triangulation_observation(
+            frame_index=frame_index,
+            pixel_u=u,
+            pixel_v=v,
+            theta=theta,
+            phi=phi,
+            pitch_deg=pitch_deg,
+            roll_deg=roll_deg,
+            heading_accuracy_deg=frame.heading_accuracy_deg,
+            horizontal_accuracy_m=frame.horizontal_accuracy_m,
         )
-        direction_current_enu = np.array(
-            geometry.enu_vector_from_angles(
-                theta,
-                phi,
-                1.0,
-                pose_copy.bearing_rad,
-                pitch_rad=math.radians(pitch_deg),
-                roll_rad=math.radians(roll_deg),
-            ),
-            dtype=np.float64,
+        candidate_observations = self._upsert_triangulation_observation(
+            self._triangulation_track_observations,
+            current_observation,
         )
-        direction_anchor_ecef = np.array(
-            geodesy.enu_to_ecef(
-                float(direction_anchor_enu[0]),
-                float(direction_anchor_enu[1]),
-                float(direction_anchor_enu[2]),
-                anchor.pose.latitude,
-                anchor.pose.longitude,
-            ),
-            dtype=np.float64,
-        )
-        direction_current_ecef = np.array(
-            geodesy.enu_to_ecef(
-                float(direction_current_enu[0]),
-                float(direction_current_enu[1]),
-                float(direction_current_enu[2]),
-                pose_copy.latitude,
-                pose_copy.longitude,
-            ),
-            dtype=np.float64,
-        )
+        if len(candidate_observations) > self.TRIANGULATION_MAX_TRACK_OBSERVATIONS:
+            anchor_idx = anchor.frame_index
+            anchor_obs = [obs for obs in candidate_observations if obs.frame_index == anchor_idx]
+            trailing = [obs for obs in candidate_observations if obs.frame_index != anchor_idx]
+            trailing = trailing[-(self.TRIANGULATION_MAX_TRACK_OBSERVATIONS - len(anchor_obs)) :]
+            candidate_observations = anchor_obs + trailing
 
-        baseline_m = float(np.linalg.norm(origin_current_ecef - origin_anchor_ecef))
+        anchor_obs = next((obs for obs in candidate_observations if obs.frame_index == anchor.frame_index), None)
+        current_obs = next((obs for obs in candidate_observations if obs.frame_index == frame_index), None)
+        if anchor_obs is None or current_obs is None:
+            QMessageBox.warning(self, "Triangulation", "Unable to build triangulation observations.")
+            return
+
+        baseline_m = float(np.linalg.norm(current_obs.origin_ecef - anchor_obs.origin_ecef))
         if baseline_m < self.MIN_TRIANGULATION_BASELINE_M:
             self.statusBar().showMessage(
                 "Triangulation baseline too small. Move to a farther frame for accurate coordinates.",
@@ -2960,33 +3638,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        anchor_weight = self._triangulation_pose_weight(
-            horizontal_accuracy_m=anchor_frame.horizontal_accuracy_m,
-            heading_accuracy_deg=anchor_frame.heading_accuracy_deg,
-        )
-        current_weight = self._triangulation_pose_weight(
-            horizontal_accuracy_m=current_frame.horizontal_accuracy_m,
-            heading_accuracy_deg=current_frame.heading_accuracy_deg,
-        )
-
         try:
-            (
-                point_ecef,
-                residual_m,
-                range_anchor_m,
-                range_current_m,
-                positive_count,
-                intersection_angle_rad,
-            ) = self._triangulate_with_direction_variants(
-                origin_a=origin_anchor_ecef,
-                direction_a=direction_anchor_ecef,
-                origin_b=origin_current_ecef,
-                direction_b=direction_current_ecef,
-                weight_a=anchor_weight,
-                weight_b=current_weight,
+            triangulation, intersection_angle_rad, median_baseline_m = self._triangulate_track_observations(
+                candidate_observations
             )
         except ValueError as exc:
-            QMessageBox.warning(self, "Two-Frame Triangulation", str(exc))
+            QMessageBox.warning(self, "Triangulation", str(exc))
             return
 
         intersection_angle_deg = math.degrees(intersection_angle_rad)
@@ -2998,10 +3655,46 @@ class MainWindow(QMainWindow):
             )
             return
 
-        residual_limit_m = max(self.MAX_TRIANGULATION_RESIDUAL_M, baseline_m * 0.35)
-        if residual_m > residual_limit_m:
+        point_ecef = triangulation.point_ecef
+        residual_m = float(triangulation.residual_rms_m)
+        ranges_m = triangulation.ranges_m
+        positive_count = int(np.count_nonzero(ranges_m > 0.0))
+        current_obs_idx = next(
+            (idx for idx, obs in enumerate(candidate_observations) if obs.frame_index == frame_index),
+            None,
+        )
+        if current_obs_idx is None:
+            QMessageBox.warning(self, "Triangulation", "Triangulation observation index mismatch.")
+            return
+        range_current_m = float(ranges_m[current_obs_idx])
+        if range_current_m <= 0.0:
             self.statusBar().showMessage(
-                "Triangulation residual is too high for accurate output. "
+                "Current-frame ray intersects behind the camera. Re-click the same feature in this frame.",
+                4500,
+            )
+            return
+        ray_errors_deg = [
+            math.degrees(
+                geometry.acute_angle_between_vectors(
+                    obs.direction_ecef,
+                    point_ecef - obs.origin_ecef,
+                )
+            )
+            for obs in candidate_observations
+        ]
+        max_ray_error_deg = max(ray_errors_deg) if ray_errors_deg else float("inf")
+        if max_ray_error_deg > self.HARD_MAX_TRIANGULATION_RAY_ERROR_DEG:
+            self.statusBar().showMessage(
+                "Feature correspondence is highly inconsistent between frames. "
+                "Re-click the same landmark more precisely.",
+                5000,
+            )
+            return
+
+        residual_limit_m = max(self.MAX_TRIANGULATION_RESIDUAL_M, median_baseline_m * 0.35)
+        if residual_m > (residual_limit_m * 3.0):
+            self.statusBar().showMessage(
+                "Triangulation residual is extremely high. "
                 "Re-click using a clearer feature and a wider baseline.",
                 5000,
             )
@@ -3017,6 +3710,8 @@ class MainWindow(QMainWindow):
                     width,
                     height,
                 )
+                fallback_measurement.quality_score = 30.0
+                fallback_measurement.quality_label = "Fallback"
                 self._append_measurement(
                     fallback_measurement,
                     marker_theta=theta,
@@ -3033,44 +3728,119 @@ class MainWindow(QMainWindow):
             except ValueError:
                 QMessageBox.warning(
                     self,
-                    "Two-Frame Triangulation",
+                    "Triangulation",
                     "Triangulation is unstable for this point. Try a farther frame or click a stronger feature.",
                 )
                 return
 
         uncertainty_m = self._estimate_triangulation_uncertainty_m(
+            observations=candidate_observations,
+            ranges_m=ranges_m,
             baseline_m=baseline_m,
             angle_rad=intersection_angle_rad,
-            range_anchor_m=range_anchor_m,
-            range_current_m=range_current_m,
             image_width=width,
             image_height=height,
-            anchor_heading_acc_deg=anchor_frame.heading_accuracy_deg,
-            current_heading_acc_deg=current_frame.heading_accuracy_deg,
-            anchor_hacc_m=anchor_frame.horizontal_accuracy_m,
-            current_hacc_m=current_frame.horizontal_accuracy_m,
         )
+        if uncertainty_m > self.HARD_MAX_TRIANGULATION_SIGMA_M:
+            self.statusBar().showMessage(
+                "Triangulation uncertainty is extremely high for this pair. "
+                "Use a farther frame and re-click the same feature.",
+                5000,
+            )
+            return
+
+        heading_sigma = np.array(
+            [
+                obs.heading_accuracy_deg if obs.heading_accuracy_deg is not None else 3.0
+                for obs in candidate_observations
+            ],
+            dtype=np.float64,
+        )
+        position_sigma = np.array(
+            [
+                obs.horizontal_accuracy_m if obs.horizontal_accuracy_m is not None else 2.0
+                for obs in candidate_observations
+            ],
+            dtype=np.float64,
+        )
+        ba_inputs = dict(
+            point_seed=point_ecef,
+            origins=np.stack([obs.origin_ecef for obs in candidate_observations], axis=0),
+            directions=np.stack([obs.direction_ecef for obs in candidate_observations], axis=0),
+            weights=np.array(
+                [
+                    self._triangulation_pose_weight(
+                        horizontal_accuracy_m=obs.horizontal_accuracy_m,
+                        heading_accuracy_deg=obs.heading_accuracy_deg,
+                    )
+                    for obs in candidate_observations
+                ],
+                dtype=np.float64,
+            ),
+            heading_sigma_deg=heading_sigma,
+            position_sigma_m=position_sigma,
+        )
+        try:
+            ba_result = multiview.bundle_adjust_point_with_pose_priors(
+                **ba_inputs,
+                solver_backend="ceres",
+            )
+        except Exception as exc:
+            logger.warning("Ceres BA failed; falling back to SciPy: {}", exc)
+            ba_result = multiview.bundle_adjust_point_with_pose_priors(
+                **ba_inputs,
+                solver_backend="scipy",
+            )
+        point_ecef = ba_result.point_ecef
+        residual_m = min(residual_m, float(ba_result.residual_rms_m))
+        ranges_m = np.sum(
+            ba_result.adjusted_directions
+            * (point_ecef[None, :] - ba_result.adjusted_origins),
+            axis=1,
+        )
+        range_current_m = float(ranges_m[current_obs_idx])
+        if range_current_m <= 0.0:
+            self.statusBar().showMessage(
+                "Bundle-adjusted solution places the point behind current camera. Re-click the feature.",
+                4500,
+            )
+            return
 
         lat, lon, alt = geodesy.ecef_to_geodetic(
             float(point_ecef[0]),
             float(point_ecef[1]),
             float(point_ecef[2]),
         )
+        current_lat, current_lon, current_alt = self._resolve_frame_position(frame_index)
         east_cur, north_cur, up_cur = geodesy.geodetic_to_enu(
             lat,
             lon,
             alt,
-            pose_copy.latitude,
-            pose_copy.longitude,
-            pose_copy.altitude,
+            current_lat,
+            current_lon,
+            current_alt,
         )
 
+        self._triangulation_track_observations = candidate_observations
         pixel = PixelSelection(u=u, v=v, width=width, height=height)
+        triang_quality_score = self._triangulation_quality_score(
+            baseline_m=baseline_m,
+            angle_deg=intersection_angle_deg,
+            residual_m=residual_m,
+            uncertainty_m=uncertainty_m,
+            ray_error_deg=max_ray_error_deg,
+        )
+        if use_refined:
+            triang_quality_score = float(np.clip(triang_quality_score + (template_score * 4.0), 0.0, 100.0))
+        if inlier_ratio is not None:
+            triang_quality_score = float(np.clip(triang_quality_score + (12.0 * inlier_ratio), 0.0, 100.0))
         measurement = PointMeasurement(
             pixel=pixel,
             depth_m=range_current_m,
             enu_vector=(east_cur, north_cur, up_cur),
             geodetic=(lat, lon, alt),
+            quality_score=triang_quality_score,
+            quality_label=self._quality_label_from_score(triang_quality_score),
         )
         local_vec = geometry.spherical_direction(theta, phi) * range_current_m
 
@@ -3081,19 +3851,36 @@ class MainWindow(QMainWindow):
             marker_frame_index=frame_index,
         )
         self._update_selection_labels(measurement, local_vec)
+        quality_warnings: list[str] = []
+        if residual_m > residual_limit_m:
+            quality_warnings.append("high residual")
+        if max_ray_error_deg > self.MAX_TRIANGULATION_RAY_ERROR_DEG:
+            quality_warnings.append("ray mismatch")
+        if uncertainty_m > self.MAX_TRIANGULATION_SIGMA_M:
+            quality_warnings.append("high uncertainty")
+        if use_refined:
+            quality_warnings.append(f"template {template_score:.2f}")
+        if inlier_ratio is not None:
+            quality_warnings.append(f"pose inliers {inlier_ratio:.2f}")
+        quality_warnings.append(f"BA {ba_result.solver_backend}")
         self.depth_source_label.setText(
-            "Two-frame triangulation "
-            f"(angle {intersection_angle_deg:.2f} deg, residual {residual_m:.2f} m, est. sigma {uncertainty_m:.2f} m)"
+            "Multi-frame triangulation "
+            f"(angle {intersection_angle_deg:.2f} deg, residual {residual_m:.2f} m, "
+            f"est. sigma {uncertainty_m:.2f} m, inliers {int(np.count_nonzero(triangulation.inlier_mask))}/"
+            f"{len(candidate_observations)}, BA {ba_result.solver_backend}, quality {triang_quality_score:.0f}/100)"
         )
         if hasattr(self, "triangulation_label"):
             self.triangulation_label.setText(
-                f"Anchor frame {anchor.frame_index} active. Click another frame to triangulate more points."
+                f"Anchor {anchor.frame_index} active with {len(candidate_observations)} observations. "
+                "Click another frame to refine, or click anchor frame to start a new point."
             )
 
         message = (
-            f"Triangulated point from frames {anchor.frame_index} -> {frame_index} "
+            f"Triangulated point from frames {anchor.frame_index}->{frame_index} "
             f"(angle {intersection_angle_deg:.2f} deg, residual {residual_m:.2f} m, sigma~{uncertainty_m:.2f} m)"
         )
+        if quality_warnings:
+            message += f" [{', '.join(quality_warnings)}]"
         if uncertainty_m > 3.0:
             message += " [high uncertainty]"
         if self.pose_warning_label.isVisible():
@@ -3108,7 +3895,7 @@ class MainWindow(QMainWindow):
         )
         pose = self._state.metadata.camera_pose
         self.geo_label.setText(
-            f"{measurement.latitude:.7f}deg, {measurement.longitude:.7f}deg, {measurement.altitude:.2f} m"
+            f"{measurement.latitude:.6f}deg, {measurement.longitude:.6f}deg, {measurement.altitude:.2f} m"
             f" (pose lat {pose.latitude:.6f}deg, lon {pose.longitude:.6f}deg, alt {pose.altitude:.2f} m,"
             f" bearing {pose.bearing:.2f}deg)"
         )
@@ -3239,6 +4026,8 @@ class MainWindow(QMainWindow):
 
 
                         "altitude",
+                        "quality_score",
+                        "quality_label",
 
 
 
@@ -3411,6 +4200,9 @@ class MainWindow(QMainWindow):
 
 
             self._clear_measurement_history()
+            self._clear_triangulation_anchor(update_label=True)
+            if hasattr(self, "viewer"):
+                self.viewer.clear_selection_marker()
 
 
 
