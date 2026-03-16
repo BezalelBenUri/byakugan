@@ -13,14 +13,15 @@ class MeasurementTableModel(QAbstractTableModel):
 
     HEADERS = [
         "Point #",
+        "Quality",
+        "Latitude",
+        "Longitude",
         "Pixel U",
         "Pixel V",
         "Depth (m)",
         "East (m)",
         "North (m)",
         "Up (m)",
-        "Latitude",
-        "Longitude",
         "Altitude",
     ]
 
@@ -58,15 +59,20 @@ class MeasurementTableModel(QAbstractTableModel):
 
         mapping = {
             0: index.row() + 1,
-            1: measurement.pixel.u,
-            2: measurement.pixel.v,
-            3: f"{measurement.depth_m:.2f}",
-            4: f"{measurement.enu_vector[0]:.2f}",
-            5: f"{measurement.enu_vector[1]:.2f}",
-            6: f"{measurement.enu_vector[2]:.2f}",
-            7: f"{measurement.latitude:.7f}",
-            8: f"{measurement.longitude:.7f}",
-            9: f"{measurement.altitude:.2f}",
+            1: (
+                f"{measurement.quality_score:.0f}/100 ({measurement.quality_label})"
+                if measurement.quality_score is not None
+                else measurement.quality_label
+            ),
+            2: f"{measurement.latitude:.6f}",
+            3: f"{measurement.longitude:.6f}",
+            4: measurement.pixel.u,
+            5: measurement.pixel.v,
+            6: f"{measurement.depth_m:.2f}",
+            7: f"{measurement.enu_vector[0]:.2f}",
+            8: f"{measurement.enu_vector[1]:.2f}",
+            9: f"{measurement.enu_vector[2]:.2f}",
+            10: f"{measurement.altitude:.2f}",
         }
         return mapping.get(index.column(), "")
 
