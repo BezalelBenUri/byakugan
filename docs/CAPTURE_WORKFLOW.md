@@ -12,7 +12,9 @@ The implemented workflow targets **stitched exports** that contain:
 - optional `Output/*-gps.txt` raw GNSS stream
 - optional `Output/*-imu.csv` raw IMU stream
 
-Raw unstitched sensor-video workflows remain a future phase.
+Raw unstitched sensor-video folders are now parsed by `io.raw_capture` for
+calibrated pre-stitch ray construction, while interactive viewer rendering
+still requires stitched panoramas.
 
 ## Input Contract
 
@@ -50,18 +52,19 @@ When a stitched capture is loaded:
 3. Selecting a frame loads the corresponding panorama.
 4. Camera pose fields are auto-filled from `framepos` (`lat/lon/alt/heading`).
 5. Existing depth state is reset because each frame is a fresh panorama context.
-6. In **Two-Frame Triangulation** mode, operators can click the same feature in
-   two different frames to recover metric 3D coordinates without a depth map.
+6. In **Multi-Frame Triangulation** mode, operators can click the same feature in
+   two or more different frames to recover metric 3D coordinates without a depth map.
 7. The UI selects this mode automatically for capture folders; no manual mode
    selection is required.
 
-Frame `pitch` and `roll` are now applied in measurement geometry (depth, ground
-plane, and two-frame triangulation rays) to reduce systematic orientation error.
+Frame `pitch` and `roll` are applied in measurement geometry (depth, ground
+plane, and multi-frame triangulation rays) to reduce systematic orientation error.
 
 When `*-gps.txt` is present, Byakugan timestamp-aligns GNSS records to frame
 timestamps and enriches each frame with `hAcc`, `vAcc`, `headAcc`, and `hMSL`.
-Two-frame triangulation then uses this metadata for quality-aware output
-messages and uncertainty estimation.
+Triangulation then uses this metadata for per-ray weighting, robust inlier
+selection, Ceres-backed local BA priors, quality-aware output messages, and
+uncertainty estimation.
 
 ## Engineering Notes
 
@@ -71,8 +74,13 @@ messages and uncertainty estimation.
 - Existing geometry and depth tests should remain green to preserve baseline math
   correctness while sequence support evolves.
 
-## Next Milestones
+## Raw Folder APIs
 
-1. Add sequence-aware triangulation mode with persistent tracklets
-   (multi-frame feature intersection, not only pairwise).
-2. Add raw 4-sensor ingestion path from calibration + timestamps + videos.
+`src/byakugan_app/io/raw_capture.py` provides:
+
+- strict raw-folder parsing (`discover_raw_capture`)
+- calibration + timestamp + GNSS alignment
+- calibrated sensor ray construction (`build_raw_observation`)
+
+These APIs are designed for pipeline integration where detections in raw sensor
+frames are converted into world-space coordinates before panorama stitching.
