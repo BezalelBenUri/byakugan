@@ -15,6 +15,13 @@ def test_pixel_angle_roundtrip():
             assert abs(v2 - v) <= 1
 
 
+def test_center_pixel_maps_to_forward_direction():
+    width, height = 1024, 512
+    theta, phi = geometry.pixel_to_angles(width // 2, height // 2, width, height)
+    assert abs(((theta + math.pi) % (2.0 * math.pi)) - math.pi) < math.radians(1.0)
+    assert abs(phi) < math.radians(1.0)
+
+
 def test_enu_vector_rotation_with_bearing():
     width, height = 1024, 512
     u = width // 2
