@@ -614,3 +614,8 @@ class PanoramaWidget(QOpenGLWidget):
         self._measurement_markers = list(markers)
         self.update()
 
+    def clear_selection_marker(self) -> None:
+        """Clear transient click crosshair without altering persistent markers."""
+        self._selection_angles = None
+        self.update()
+
