@@ -380,22 +380,21 @@ class PanoramaWidget(QOpenGLWidget):
         forward /= forward_norm
 
         world_up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        # Use a right-handed camera frame so screen-left maps to world-left and
-        # screen-right maps to world-right during picking/projection.
-        right = np.cross(world_up, forward)
+        # Match gluLookAt exactly: side/right = forward x up.
+        right = np.cross(forward, world_up)
         right_norm = float(np.linalg.norm(right))
         if right_norm <= 1e-9:
             # Looking near zenith/nadir: choose a stable alternate up axis.
             alt_up = np.array([1.0, 0.0, 0.0], dtype=np.float64)
             if abs(float(np.dot(forward, alt_up))) > 0.95:
                 alt_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-            right = np.cross(alt_up, forward)
+            right = np.cross(forward, alt_up)
             right_norm = float(np.linalg.norm(right))
             if right_norm <= 1e-9:
                 return None
         right /= right_norm
 
-        up = np.cross(forward, right)
+        up = np.cross(right, forward)
         up_norm = float(np.linalg.norm(up))
         if up_norm <= 1e-9:
             return None
